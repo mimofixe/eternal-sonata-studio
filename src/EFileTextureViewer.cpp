@@ -1,14 +1,23 @@
 #include "EFileTextureViewer.h"
 #include "P3TexParser.h"
+#include "FileDialog.h"
 #include <imgui.h>
 #include <iostream>
 #include <cstring>
+#include <filesystem>
+
+// NOTA: STB_IMAGE_WRITE_IMPLEMENTATION está definido em P3TexViewer.cpp
+#include "../libs/stb/stb_image_write.h"
+
+namespace fs = std::filesystem;
 
 EFileTextureViewer::EFileTextureViewer()
     : m_SelectedTextureIdx(-1),
     m_ShowDetail(false),
     m_ThumbnailSize(128),
-    m_GridColumns(6) {
+    m_GridColumns(6),
+    m_ShowExportPopup(false),
+    m_ExportSuccess(false) {
 }
 
 EFileTextureViewer::~EFileTextureViewer() {
@@ -106,6 +115,32 @@ void EFileTextureViewer::Render() {
     else {
         RenderGrid();
     }
+
+    // Export popup
+    if (m_ShowExportPopup) {
+        ImGui::OpenPopup("Export Result##EFile");
+        m_ShowExportPopup = false;
+    }
+
+    if (ImGui::BeginPopupModal("Export Result##EFile", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (m_ExportSuccess) {
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Export Successful!");
+            ImGui::Separator();
+            ImGui::TextWrapped("Saved to:");
+            ImGui::TextWrapped("%s", m_LastExportPath.c_str());
+        }
+        else {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Export Cancelled or Failed");
+            ImGui::Separator();
+            ImGui::TextWrapped("No file was saved.");
+        }
+
+        ImGui::Separator();
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
 
 void EFileTextureViewer::RenderGrid() {
@@ -133,7 +168,6 @@ void EFileTextureViewer::RenderGrid() {
         }
 
         ImGui::BeginGroup();
-
         ImGui::PushID((int)i);
 
         if (gpuTexture != 0) {
@@ -175,7 +209,6 @@ void EFileTextureViewer::RenderGrid() {
             ImGui::EndGroup();
         }
         else {
-            // Error placeholder
             ImGui::Button("...", ImVec2(m_ThumbnailSize, m_ThumbnailSize));
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Failed to load");
@@ -220,7 +253,13 @@ void EFileTextureViewer::RenderDetail() {
 
     ImGui::Separator();
 
+    // Export button
+    if (ImGui::Button("Export as PNG", ImVec2(-1, 0))) {
+        ExportTexturePNG(m_SelectedTextureIdx);
+    }
+
     // Navigation
+    ImGui::Separator();
     if (ImGui::Button("< Previous", ImVec2(-1, 0)) && m_SelectedTextureIdx > 0) {
         m_SelectedTextureIdx--;
     }
@@ -291,4 +330,76 @@ void EFileTextureViewer::GeneratePreview(size_t textureIdx) {
     }
 
     m_TextureCache.GetOrCreateTexture(tex.id, rgba.data(), tex.width, tex.height);
+}
+
+void EFileTextureViewer::ExportTexturePNG(size_t textureIdx) {
+    if (textureIdx >= m_Textures.size()) {
+        std::cerr << "Invalid texture index" << std::endl;
+        m_ExportSuccess = false;
+        m_ShowExportPopup = true;
+        return;
+    }
+
+    const NTX3Texture& tex = m_Textures[textureIdx];
+
+    if (tex.width == 0 || tex.height == 0) {
+        std::cerr << "Invalid texture dimensions" << std::endl;
+        m_ExportSuccess = false;
+        m_ShowExportPopup = true;
+        return;
+    }
+
+    // Generate default filename
+    char defaultFilename[256];
+    snprintf(defaultFilename, sizeof(defaultFilename), "efile_texture_%03zu_%dx%d.png",
+        textureIdx, tex.width, tex.height);
+
+    // Open save dialog
+    std::string savePath = FileDialog::SaveFile("PNG Image\0*.png\0All Files\0*.*\0");
+
+    // User cancelled
+    if (savePath.empty()) {
+        std::cout << "Export cancelled by user" << std::endl;
+        m_ExportSuccess = false;
+        m_ShowExportPopup = true;
+        return;
+    }
+
+    // Ensure .png extension
+    if (savePath.find(".png") == std::string::npos) {
+        savePath += ".png";
+    }
+
+    std::cout << "Exporting texture to: " << savePath << std::endl;
+
+    // Decompress texture
+    std::vector<uint8_t> rgba;
+    if (tex.format == 0x86) {
+        rgba = P3TexParser::DecompressDXT1(tex.data.data(), tex.width, tex.height);
+    }
+    else {
+        rgba = P3TexParser::DecompressDXT5(tex.data.data(), tex.width, tex.height);
+    }
+
+    if (rgba.empty()) {
+        std::cerr << "Failed to decompress texture" << std::endl;
+        m_ExportSuccess = false;
+        m_ShowExportPopup = true;
+        return;
+    }
+
+    // Write PNG
+    int result = stbi_write_png(savePath.c_str(), tex.width, tex.height, 4, rgba.data(), tex.width * 4);
+
+    if (result) {
+        std::cout << "Successfully exported: " << savePath << std::endl;
+        m_ExportSuccess = true;
+        m_LastExportPath = savePath;
+    }
+    else {
+        std::cerr << "Failed to write PNG file" << std::endl;
+        m_ExportSuccess = false;
+    }
+
+    m_ShowExportPopup = true;
 }

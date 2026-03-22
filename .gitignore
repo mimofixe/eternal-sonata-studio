@@ -59,3 +59,4 @@ game_files/
 # Large test files
 test_data/
 samples/
+vcpkg/
