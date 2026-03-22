@@ -3,7 +3,7 @@
 
 int main() {
     std::cout << "============================\n";
-    std::cout << "Eternal Sonata Studio v1.0\n";
+    std::cout << "Eternal Sonata Studio\n";
     std::cout << "============================\n\n";
 
     AppConfig config;
