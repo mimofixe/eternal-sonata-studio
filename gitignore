@@ -1,0 +1,63 @@
+# Build directories
+build/
+out/
+bin/
+lib/
+cmake-build-*/
+
+# Visual Studio
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled files
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+
+# Debug files
+*.pdb
+*.ilk
+*.log
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Game data (NÃO commitar ficheiros do jogo)
+*.e
+*.p3tex
+data/
+game_files/
+
+# Large test files
+test_data/
+samples/
+
+# vcpkg
+vcpkg/
