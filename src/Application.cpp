@@ -13,7 +13,8 @@
 #include "Viewport3D.h"
 #include "P3TexViewer.h"
 #include "EFileTextureViewer.h"
-#include "EFileTextExtractor.h"  // NOVO
+#include "EFileTextExtractor.h" 
+#include "CSFViewer.h"
 
 Application::Application(const AppConfig& config)
     : m_Config(config), m_Running(false) {
@@ -70,7 +71,8 @@ void Application::Run() {
     Viewport3D viewport;
     P3TexViewer tex_viewer;
     EFileTextureViewer efile_tex_viewer;
-    EFileTextExtractor text_extractor;  // NOVO
+    EFileTextExtractor text_extractor;
+    CSFViewer csf_viewer;  // CSF Viewer local
 
     chunk_inspector.SetViewport(&viewport);
     chunk_inspector.SetP3TexParser(&m_P3TexParser);
@@ -154,9 +156,14 @@ void Application::Run() {
         efile_tex_viewer.Render();
         ImGui::End();
 
-        // .E FILE Text Viewer (NOVO)
+        // .E FILE Text Viewer
         ImGui::Begin("File Text (.e)");
         text_extractor.Render();
+        ImGui::End();
+
+        // CSF Audio Viewer 
+        ImGui::Begin("CSF Audio Viewer");
+        csf_viewer.Render();
         ImGui::End();
 
         // File Browser
@@ -167,23 +174,42 @@ void Application::Run() {
             std::string new_file = file_browser.GetSelectedFile();
             if (new_file != current_file_path) {
                 current_file_path = new_file;
-                loaded_chunks = EFileParser::Parse(current_file_path);
 
-                std::ifstream file(current_file_path, std::ios::binary);
-                if (file) {
-                    file.seekg(0, std::ios::end);
-                    size_t size = file.tellg();
-                    file.seekg(0, std::ios::beg);
-                    current_file_data.resize(size);
-                    file.read((char*)current_file_data.data(), size);
-                    file.close();
+                // detect file type and load
+                std::string extension;
+                size_t dot_pos = current_file_path.find_last_of('.');
+                if (dot_pos != std::string::npos) {
+                    extension = current_file_path.substr(dot_pos);
+                    // Converter para lowercase
+                    for (char& c : extension) {
+                        c = std::tolower(c);
+                    }
                 }
 
-                selected_chunk_idx = -1;
+                // if it is csf load in csf viewer
+                if (extension == ".csf") {
+                    csf_viewer.LoadFile(current_file_path);
+                }
+                // if it's e load normally
+                else if (extension == ".e") {
+                    loaded_chunks = EFileParser::Parse(current_file_path);
 
-                // Atualizar visualizadores
-                efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
-                text_extractor.LoadFromFile(current_file_data);  // NOVO
+                    std::ifstream file(current_file_path, std::ios::binary);
+                    if (file) {
+                        file.seekg(0, std::ios::end);
+                        size_t size = file.tellg();
+                        file.seekg(0, std::ios::beg);
+                        current_file_data.resize(size);
+                        file.read((char*)current_file_data.data(), size);
+                        file.close();
+                    }
+
+                    selected_chunk_idx = -1;
+
+                    // update viewer
+                    efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
+                    text_extractor.LoadFromFile(current_file_data);
+                }
             }
         }
         ImGui::End();
@@ -287,6 +313,7 @@ void Application::Run() {
         // 3D Viewport
         viewport.Render();
 
+  
         ImGui::Render();
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);

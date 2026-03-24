@@ -34,6 +34,7 @@ target_link_libraries(imgui PUBLIC glfw)
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/libs/spdlog/include
+    ${CMAKE_SOURCE_DIR}/libs/minimp3
 )
 
 add_executable(es_studio
@@ -52,6 +53,9 @@ add_executable(es_studio
     src/P3TexViewer.cpp
     src/EFileTextureViewer.cpp
     src/EFileTextExtractor.cpp
+    src/CSFParser.cpp
+    src/ATRAC3Writer.cpp
+    src/CSFViewer.cpp
 )
 
 target_link_libraries(es_studio PRIVATE
