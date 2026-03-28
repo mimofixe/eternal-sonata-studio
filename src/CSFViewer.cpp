@@ -22,6 +22,15 @@ void CSFViewer::LoadFile(const std::string& filepath) {
     m_HasFile = CSFParser::Load(filepath, m_CSF);
 }
 
+// Load a CSF chunk that is already in memory (e.g. clicked inside a BMD file)
+void CSFViewer::LoadFromMemory(const uint8_t* data, size_t size, const std::string& label) {
+    Clear();
+    m_HasFile = CSFParser::LoadFromMemory(data, size, m_CSF);
+    if (m_HasFile) {
+        m_CSF.filename = label;
+    }
+}
+
 void CSFViewer::Clear() {
     m_CSF = CSFFile();
     m_HasFile = false;
@@ -88,6 +97,7 @@ void CSFViewer::RenderInfo() {
 
     fs::path filePath(m_CSF.filename);
     std::string filename = filePath.filename().string();
+    if (filename.empty()) filename = m_CSF.filename;
 
     ImGui::Text("File: %s", filename.c_str());
     ImGui::Text("Format: CSF (ATRAC3)");

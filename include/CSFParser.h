@@ -41,6 +41,7 @@ struct CSFFile {
 class CSFParser {
 public:
     static bool Load(const std::string& filepath, CSFFile& out);
+    static bool LoadFromMemory(const uint8_t* data, size_t size, CSFFile& out);
     static bool ExportClipAT3(const CSFFile& csf, uint32_t clip_index, const std::string& output_path);
     static bool ExportAllClipsAT3(const CSFFile& csf, const std::string& base_path);
 

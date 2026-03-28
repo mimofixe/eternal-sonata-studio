@@ -6,6 +6,7 @@
 #include <imgui_impl_opengl3.h>
 #include <iostream>
 #include <fstream>
+#include <set>
 #include "EFileParser.h"
 #include "BOPParser.h"
 #include "ContainerParser.h"
@@ -86,6 +87,9 @@ void Application::Run() {
     std::string current_file_path;
     int selected_chunk_idx = -1;
     bool is_container_file = false;
+    std::set<int> csf_checked;
+    bool show_csf_batch_result = false;
+    int csf_batch_exported = 0;
 
     while (!glfwWindowShouldClose(window) && m_Running) {
         glfwPollEvents();
@@ -185,6 +189,7 @@ void Application::Run() {
                 loaded_chunks.clear();
                 container_sections.clear();
                 is_container_file = false;
+                csf_checked.clear();
 
                 if (extension == ".csf") {
                     csf_viewer.LoadFile(current_file_path);
@@ -304,6 +309,11 @@ void Application::Run() {
                                         selected_chunk_idx == chunk_global_idx, flags)) {
                                         selected_chunk_idx = chunk_global_idx;
                                         chunk_inspector.SetChunk(chunk, current_file_data);
+                                        if (chunk.type == ChunkType::CSF && !current_file_data.empty()) {
+                                            csf_viewer.LoadFromMemory(
+                                                current_file_data.data() + chunk.offset,
+                                                chunk.size, chunk.name);
+                                        }
                                     }
 
                                     ImGui::SameLine();
@@ -331,8 +341,6 @@ void Application::Run() {
                             }
                         }
                         else if (section.type == "nobj") {
-                            // NOBJ is a sub-container (like Mefc). Show as a collapsible
-                            // tree node; the NTX3/NMTN/etc. chunks inside are the children.
                             ImGui::TableNextRow();
                             ImGui::TableSetColumnIndex(0);
 
@@ -364,6 +372,11 @@ void Application::Run() {
                                         selected_chunk_idx == chunk_global_idx, flags)) {
                                         selected_chunk_idx = chunk_global_idx;
                                         chunk_inspector.SetChunk(chunk, current_file_data);
+                                        if (chunk.type == ChunkType::CSF && !current_file_data.empty()) {
+                                            csf_viewer.LoadFromMemory(
+                                                current_file_data.data() + chunk.offset,
+                                                chunk.size, chunk.name);
+                                        }
                                     }
 
                                     ImGui::SameLine();
@@ -402,6 +415,11 @@ void Application::Run() {
                                 selected_chunk_idx == chunk_global_idx, flags)) {
                                 selected_chunk_idx = chunk_global_idx;
                                 chunk_inspector.SetChunk(chunk, current_file_data);
+                                if (chunk.type == ChunkType::CSF && !current_file_data.empty()) {
+                                    csf_viewer.LoadFromMemory(
+                                        current_file_data.data() + chunk.offset,
+                                        chunk.size, chunk.name);
+                                }
                             }
 
                             ImGui::SameLine();
@@ -432,6 +450,11 @@ void Application::Run() {
                         if (ImGui::Selectable(("##chunk" + std::to_string(i)).c_str(), selected_chunk_idx == i, flags)) {
                             selected_chunk_idx = i;
                             chunk_inspector.SetChunk(chunk, current_file_data);
+                            if (chunk.type == ChunkType::CSF && !current_file_data.empty()) {
+                                csf_viewer.LoadFromMemory(
+                                    current_file_data.data() + chunk.offset,
+                                    chunk.size, chunk.name);
+                            }
                         }
 
                         ImGui::SameLine();
@@ -450,6 +473,115 @@ void Application::Run() {
                 }
 
                 ImGui::EndTable();
+
+                // CSF batch export panel — shown whenever the loaded file has CSF chunks
+                std::vector<int> csf_indices;
+                for (int i = 0; i < (int)loaded_chunks.size(); i++) {
+                    if (loaded_chunks[i].type == ChunkType::CSF) csf_indices.push_back(i);
+                }
+
+                if (!csf_indices.empty()) {
+                    ImGui::Separator();
+                    ImGui::Text("CSF Audio Export (%d tracks)", (int)csf_indices.size());
+                    ImGui::Separator();
+
+                    // Scrollable checkbox list
+                    ImGui::BeginChild("CSFCheckList", ImVec2(0, 120), true);
+                    for (int j = 0; j < (int)csf_indices.size(); j++) {
+                        int chunk_idx = csf_indices[j];
+                        const Chunk& c = loaded_chunks[chunk_idx];
+                        bool checked = csf_checked.count(chunk_idx) > 0;
+                        if (ImGui::Checkbox(("##csf" + std::to_string(j)).c_str(), &checked)) {
+                            if (checked) csf_checked.insert(chunk_idx);
+                            else csf_checked.erase(chunk_idx);
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("%s  (%.1f KB)", c.name, c.size / 1024.0f);
+                    }
+                    ImGui::EndChild();
+
+                    if (ImGui::SmallButton("Select All")) {
+                        for (int idx : csf_indices) csf_checked.insert(idx);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Clear")) {
+                        csf_checked.clear();
+                    }
+
+                    ImGui::Spacing();
+
+                    // Export selected
+                    ImGui::BeginDisabled(csf_checked.empty());
+                    char sel_label[48];
+                    snprintf(sel_label, sizeof(sel_label), "Export Selected (%d)", (int)csf_checked.size());
+                    if (ImGui::Button(sel_label, ImVec2(-1, 0))) {
+                        std::string base = FileDialog::SaveFile("ATRAC3 Audio\0*.at3\0All Files\0*.*\0");
+                        if (!base.empty()) {
+                            size_t ext = base.find_last_of('.');
+                            if (ext != std::string::npos) base = base.substr(0, ext);
+                            int n = 0, ci_n = 0;
+                            for (int idx : csf_checked) {
+                                const Chunk& c = loaded_chunks[idx];
+                                if (c.offset + c.size > current_file_data.size()) { ci_n++; continue; }
+                                CSFFile csf;
+                                if (CSFParser::LoadFromMemory(current_file_data.data() + c.offset, c.size, csf)) {
+                                    for (size_t ci = 0; ci < csf.clips.size(); ci++) {
+                                        char suf[32];
+                                        snprintf(suf, sizeof(suf), "_%03d_%03d.at3", ci_n, (int)ci);
+                                        if (CSFParser::ExportClipAT3(csf, (uint32_t)ci, base + suf)) n++;
+                                    }
+                                }
+                                ci_n++;
+                            }
+                            csf_batch_exported = n;
+                            show_csf_batch_result = true;
+                        }
+                    }
+                    ImGui::EndDisabled();
+
+                    // Export all
+                    if (ImGui::Button("Export All CSF", ImVec2(-1, 0))) {
+                        std::string base = FileDialog::SaveFile("ATRAC3 Audio\0*.at3\0All Files\0*.*\0");
+                        if (!base.empty()) {
+                            size_t ext = base.find_last_of('.');
+                            if (ext != std::string::npos) base = base.substr(0, ext);
+                            int n = 0;
+                            for (int j = 0; j < (int)csf_indices.size(); j++) {
+                                const Chunk& c = loaded_chunks[csf_indices[j]];
+                                if (c.offset + c.size > current_file_data.size()) continue;
+                                CSFFile csf;
+                                if (CSFParser::LoadFromMemory(current_file_data.data() + c.offset, c.size, csf)) {
+                                    for (size_t ci = 0; ci < csf.clips.size(); ci++) {
+                                        char suf[32];
+                                        snprintf(suf, sizeof(suf), "_%03d_%03d.at3", j, (int)ci);
+                                        if (CSFParser::ExportClipAT3(csf, (uint32_t)ci, base + suf)) n++;
+                                    }
+                                }
+                            }
+                            csf_batch_exported = n;
+                            show_csf_batch_result = true;
+                        }
+                    }
+
+                    // Result popup
+                    if (show_csf_batch_result) {
+                        ImGui::OpenPopup("CSF Export Result");
+                        show_csf_batch_result = false;
+                    }
+                    if (ImGui::BeginPopupModal("CSF Export Result", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                        if (csf_batch_exported > 0) {
+                            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Export successful");
+                            ImGui::Text("Exported %d .at3 file(s).", csf_batch_exported);
+                        }
+                        else {
+                            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Export failed");
+                        }
+                        ImGui::Separator();
+                        if (ImGui::Button("OK", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+                        ImGui::EndPopup();
+                    }
+                }
+
             }
         }
         ImGui::End();

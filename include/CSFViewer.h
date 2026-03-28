@@ -10,6 +10,7 @@ public:
     ~CSFViewer();
 
     void LoadFile(const std::string& filepath);
+    void LoadFromMemory(const uint8_t* data, size_t size, const std::string& label);
     void Clear();
     void Render();
 

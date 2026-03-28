@@ -148,6 +148,42 @@ bool CSFParser::Load(const std::string& filepath, CSFFile& out) {
     return true;
 }
 
+// Parse a CSF chunk that is already loaded in memory (e.g. inside a BMD file)
+bool CSFParser::LoadFromMemory(const uint8_t* data, size_t size, CSFFile& out) {
+    if (!ValidateHeader(data, size)) {
+        out.valid = false;
+        return false;
+    }
+
+    out.valid = true;
+
+    out.file_size = ReadU32BE(&data[0x04]);
+    out.audio_start = ReadU32BE(&data[0x08]);
+    out.audio_size = ReadU32BE(&data[0x0C]);
+
+    if (!ParseBOOK(out, data, size)) {
+        out.valid = false;
+        return false;
+    }
+
+    if (!ExtractTIMSections(out, data, size)) {
+        out.valid = false;
+        return false;
+    }
+
+    if (out.audio_start < size) {
+        size_t audio_size = size - out.audio_start;
+        out.audio_data.resize(audio_size);
+        memcpy(out.audio_data.data(), &data[out.audio_start], audio_size);
+    }
+    else {
+        out.valid = false;
+        return false;
+    }
+
+    return true;
+}
+
 // Export single clip as valid AT3 file with RIFF/WAVE container
 bool CSFParser::ExportClipAT3(const CSFFile& csf, uint32_t clip_index, const std::string& output_path) {
     if (!csf.valid || clip_index >= csf.clips.size()) {
