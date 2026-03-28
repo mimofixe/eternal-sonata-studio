@@ -3,10 +3,6 @@
 #include <cstring>
 #include <algorithm>
 
-
-// Public entry point
-
-
 ContainerFile ContainerParser::Parse(const std::string& filepath) {
     ContainerFile result;
     result.filename = filepath;
@@ -27,6 +23,14 @@ ContainerFile ContainerParser::Parse(const std::string& filepath) {
     if (!ParseHeader(data.data(), file_size, result)) {
         return result;
     }
+
+    // SCP has a unique header layout, handled separately
+    if (result.type == ContainerType::SCP) {
+        ParseSCPContent(data.data(), file_size, result);
+        return result;
+    }
+
+    // Parse leading section if bytes 12-15 contained a valid section offset
     if (result.has_leading_section) {
         ContainerSection section;
         if (ParseSection(data.data(), result.leading_section_offset, file_size, section)) {
@@ -35,6 +39,7 @@ ContainerFile ContainerParser::Parse(const std::string& filepath) {
         }
     }
 
+    // Parse offset table at 0x10
     for (uint32_t i = 0; i < result.table_count; i++) {
         size_t offset_pos = result.offset_table_start + i * 4;
         if (offset_pos + 4 > file_size) {
@@ -56,16 +61,6 @@ ContainerFile ContainerParser::Parse(const std::string& filepath) {
     return result;
 }
 
-// ParseHeader
-// Header layout (shared by BMD, CAMP, SCP):
-//
-//   0x00-0x03  magic ("BMD ", "CAMP", "SCP ")
-//   0x04-0x07  file_size (BE u32)
-//   0x08-0x0B  num_sections (BE u32)
-//   0x0C-0x0F  either 0x00000000 (Tipo B) OR offset of section[0] (Tipo A)
-//   0x10+      offset table: 4 bytes per entry (BE u32 absolute offsets)
-
-
 bool ContainerParser::ParseHeader(const uint8_t* data, size_t size, ContainerFile& out) {
     if (size < 16) {
         return false;
@@ -86,23 +81,28 @@ bool ContainerParser::ParseHeader(const uint8_t* data, size_t size, ContainerFil
         return false;
     }
 
-    // Sanity: reject clearly bogus section counts
+    // SCP stores the CSL offset at bytes 8-11, not num_sections
+    if (out.type == ContainerType::SCP) {
+        out.num_sections = 0;
+        return true;
+    }
+
     if (out.num_sections > 10000) {
         return false;
     }
 
+    // If bytes 12-15 hold a valid offset, it points to a leading section
+    // that comes before the offset table (e.g. characterphoto.bmd, camp_char.bmd)
     uint32_t maybe_leading = ReadU32BE(data + 12);
     bool is_tipo_a = (maybe_leading >= 0x10 && maybe_leading < static_cast<uint32_t>(size));
 
-    out.offset_table_start = 0x10;              
+    out.offset_table_start = 0x10;
     out.has_leading_section = is_tipo_a;
     out.leading_section_offset = is_tipo_a ? maybe_leading : 0;
     out.table_count = is_tipo_a ? out.num_sections - 1 : out.num_sections;
 
     return true;
 }
-
-// ParseSection
 
 bool ContainerParser::ParseSection(const uint8_t* data, size_t offset,
     size_t file_size, ContainerSection& out) {
@@ -131,8 +131,7 @@ bool ContainerParser::ParseSection(const uint8_t* data, size_t offset,
     if (strcmp(magic, "NOBJ") == 0) {
         out.type = "nobj";
 
-        // Always initialize out.chunk so Application.cpp can display this
-        // section without reading uninitialized memory (0xCC in MSVC debug).
+        // Initialize out.chunk so the chunks panel can display this section
         out.chunk.offset = offset;
         out.chunk.size = sec_size;
         out.chunk.magic = *reinterpret_cast<const uint32_t*>(data + offset);
@@ -144,7 +143,6 @@ bool ContainerParser::ParseSection(const uint8_t* data, size_t offset,
         return true;
     }
 
-    // Generic chunk (NTX3, NMTN, CSF, FONT, …)
     out.type = "chunk";
 
     Chunk chunk;
@@ -158,8 +156,6 @@ bool ContainerParser::ParseSection(const uint8_t* data, size_t offset,
     out.chunk = chunk;
     return true;
 }
-
-// ParseMefcContainer
 
 bool ContainerParser::ParseMefcContainer(const uint8_t* data, size_t offset,
     size_t mefc_size, ContainerSection& out) {
@@ -201,18 +197,15 @@ bool ContainerParser::ParseMefcContainer(const uint8_t* data, size_t offset,
     return !out.chunks.empty();
 }
 
-// ParseNOBJContainer
-// NOBJ is a sub-container found in BMD files (e.g. appkeep2.bmd).
-// Structure: NOBJ header (8) → NPAD → NMDL → [NTX3, NSHP, NMTN, ...]
-// Chunks are nested: NTX3/NSHP are INSIDE NMDL, which is INSIDE NOBJ.
-
+// Scans every byte inside the NOBJ and collects all known chunks at any depth,
+// matching EFileParser behaviour for .e files. Leaf chunks skip past their data
+// to avoid false positives; container types let the scan enter them naturally.
 void ContainerParser::ParseNOBJContainer(const uint8_t* data, size_t offset,
     size_t nobj_size, size_t file_size,
     ContainerSection& out) {
     size_t nobj_end = offset + nobj_size;
     if (nobj_end > file_size) nobj_end = file_size;
 
-    // Start after the 8-byte NOBJ header.
     for (size_t i = offset + 8; i + 8 <= nobj_end; i++) {
         uint32_t magic = *reinterpret_cast<const uint32_t*>(data + i);
         ChunkType type = GetChunkTypeFromMagic(magic);
@@ -229,14 +222,12 @@ void ContainerParser::ParseNOBJContainer(const uint8_t* data, size_t offset,
         chunk.type = type;
         memset(chunk.name, 0, sizeof(chunk.name));
 
-        // Assign name using the same convention as EFileParser
         switch (type) {
         case ChunkType::NOBJ:
             strncpy(chunk.name, "[container]", sizeof(chunk.name) - 1);
             break;
 
         case ChunkType::NMDL:
-            // Model name string starts 16 bytes into the chunk
             if (i + 16 < nobj_end) {
                 size_t j = 0;
                 for (; j < sizeof(chunk.name) - 1 && i + 16 + j < nobj_end; j++) {
@@ -251,7 +242,6 @@ void ContainerParser::ParseNOBJContainer(const uint8_t* data, size_t offset,
 
         case ChunkType::NSHP:
         case ChunkType::NMTN: {
-            // Name string starts immediately after the 8-byte header
             size_t j = 0;
             for (; j < sizeof(chunk.name) - 1 && i + 8 + j < nobj_end; j++) {
                 uint8_t c = data[i + 8 + j];
@@ -292,20 +282,13 @@ void ContainerParser::ParseNOBJContainer(const uint8_t* data, size_t offset,
 
         out.chunks.push_back(chunk);
 
-        // After finding a chunk, skip to its end so we don't pick up the
-        // same magic again from within its header. We still scan INSIDE
-        // containers (NOBJ, NMDL) by NOT advancing here for those types —
-        // the byte scan naturally enters them on the next iterations.
-        // For leaf chunks, advance past the entire chunk to avoid false
-        // positives from pixel/vertex data that might contain magic bytes.
         if (type != ChunkType::NOBJ && type != ChunkType::NMDL) {
-            i += chunk_size - 1;  // -1 because loop does i++
+            i += chunk_size - 1;
         }
     }
 }
 
-// CollectChunks — add a section's chunks into the ContainerFile totals
-
+// Adds all chunks from a parsed section into the ContainerFile totals
 void ContainerParser::CollectChunks(const ContainerSection& sec, ContainerFile& out) {
     if (sec.type == "chunk") {
         out.all_chunks.push_back(sec.chunk);
@@ -339,7 +322,73 @@ void ContainerParser::CollectChunks(const ContainerSection& sec, ContainerFile& 
     }
 }
 
-// Helpers
+// SCP header: "SCP " + file_size + CSL_offset + NTX3_count + NTX3 offset table
+// CSL section: "CSL " + CSF_count + CSF relative offset table
+void ContainerParser::ParseSCPContent(const uint8_t* data, size_t file_size,
+    ContainerFile& out) {
+    uint32_t ntx3_count = ReadU32BE(data + 12);
+
+    for (uint32_t i = 0; i < ntx3_count; i++) {
+        size_t tbl_pos = 0x10 + static_cast<size_t>(i) * 4;
+        if (tbl_pos + 4 > file_size) break;
+
+        uint32_t off = ReadU32BE(data + tbl_pos);
+        if (off + 8 > file_size) continue;
+        if (memcmp(data + off, "NTX3", 4) != 0) continue;
+
+        uint32_t chunk_size = ReadU32BE(data + off + 4);
+        if (chunk_size == 0 || off + chunk_size > file_size) continue;
+
+        ContainerSection sec;
+        sec.offset = off;
+        sec.type = "chunk";
+        sec.magic = "NTX3";
+        sec.size = chunk_size;
+
+        sec.chunk.offset = off;
+        sec.chunk.size = chunk_size;
+        sec.chunk.magic = *reinterpret_cast<const uint32_t*>(data + off);
+        sec.chunk.type = ChunkType::NTX3;
+        snprintf(sec.chunk.name, sizeof(sec.chunk.name), "texture_%u", i);
+
+        out.sections.push_back(sec);
+        CollectChunks(sec, out);
+    }
+
+    // CSL section holds all CSF chunks with offsets relative to the CSL start
+    uint32_t csl_off = ReadU32BE(data + 8);
+    if (csl_off + 8 > file_size) return;
+    if (memcmp(data + csl_off, "CSL ", 4) != 0) return;
+
+    uint32_t csf_count = ReadU32BE(data + csl_off + 4);
+
+    for (uint32_t i = 0; i < csf_count; i++) {
+        size_t tbl_pos = csl_off + 8 + static_cast<size_t>(i) * 4;
+        if (tbl_pos + 4 > file_size) break;
+
+        uint32_t abs_off = csl_off + ReadU32BE(data + tbl_pos);
+        if (abs_off + 8 > file_size) continue;
+        if (memcmp(data + abs_off, "CSF ", 4) != 0) continue;
+
+        uint32_t chunk_size = ReadU32BE(data + abs_off + 4);
+        if (chunk_size == 0 || abs_off + chunk_size > file_size) continue;
+
+        ContainerSection sec;
+        sec.offset = abs_off;
+        sec.type = "chunk";
+        sec.magic = "CSF ";
+        sec.size = chunk_size;
+
+        sec.chunk.offset = abs_off;
+        sec.chunk.size = chunk_size;
+        sec.chunk.magic = *reinterpret_cast<const uint32_t*>(data + abs_off);
+        sec.chunk.type = ChunkType::CSF;
+        snprintf(sec.chunk.name, sizeof(sec.chunk.name), "audio_%u", i);
+
+        out.sections.push_back(sec);
+        CollectChunks(sec, out);
+    }
+}
 
 ContainerType ContainerParser::DetectType(const char magic[4]) {
     if (strncmp(magic, "BMD ", 4) == 0) return ContainerType::BMD;

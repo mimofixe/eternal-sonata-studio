@@ -60,3 +60,4 @@ game_files/
 test_data/
 samples/
 vcpkg/
+CMakeSettings.json

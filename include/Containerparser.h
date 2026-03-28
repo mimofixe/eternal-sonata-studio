@@ -31,11 +31,10 @@ struct ContainerFile {
     uint32_t file_size;
     uint32_t num_sections;
 
-    // Offset table is ALWAYS at 0x10.
-    // Some containers (Tipo A) also have a "leading section" stored in bytes 12-15
-    // that is NOT part of the offset table. See ParseHeader comments.
+    // Offset table is always at 0x10.
+    // Some containers also have a leading section stored in bytes 12-15.
     uint32_t offset_table_start;
-    uint32_t table_count;           // entries in the table at offset_table_start
+    uint32_t table_count;
     bool has_leading_section;
     uint32_t leading_section_offset;
 
@@ -75,7 +74,9 @@ private:
         size_t nobj_size, size_t file_size,
         ContainerSection& out);
 
-    // Adds all chunks from a parsed section into the ContainerFile totals.
+    static void ParseSCPContent(const uint8_t* data, size_t file_size,
+        ContainerFile& out);
+
     static void CollectChunks(const ContainerSection& sec, ContainerFile& out);
 
     static ContainerType DetectType(const char magic[4]);
