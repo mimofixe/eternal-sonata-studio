@@ -58,6 +58,7 @@ add_executable(es_studio
     src/CSFViewer.cpp
     src/ContainerParser.cpp
     src/NTX3Parser.cpp
+    src/Texparser.cpp
 )
 
 target_link_libraries(es_studio PRIVATE

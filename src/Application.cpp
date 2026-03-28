@@ -10,6 +10,7 @@
 #include "EFileParser.h"
 #include "BOPParser.h"
 #include "ContainerParser.h"
+#include "TEXParser.h"
 #include "FileDialog.h"
 #include "FileSystemBrowser.h"
 #include "ChunkInspector.h"
@@ -243,6 +244,26 @@ void Application::Run() {
 
                     efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
                     text_extractor.LoadFromFile(current_file_data);
+                }
+                else if (extension == ".tex") {
+                    auto tex = TEXParser::Parse(current_file_path);
+
+                    if (tex.valid) {
+                        loaded_chunks = tex.chunks;
+
+                        std::ifstream file(current_file_path, std::ios::binary);
+                        if (file) {
+                            file.seekg(0, std::ios::end);
+                            size_t size = file.tellg();
+                            file.seekg(0, std::ios::beg);
+                            current_file_data.resize(size);
+                            file.read((char*)current_file_data.data(), size);
+                            file.close();
+                        }
+
+                        selected_chunk_idx = -1;
+                        efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
+                    }
                 }
             }
         }
