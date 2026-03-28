@@ -27,6 +27,7 @@ float EFileParser::ReadFloatBE(const uint8_t* data) {
 }
 
 ChunkType EFileParser::GetChunkType(uint32_t magic) {
+    //e file
     if (magic == MAGIC_NOBJ) return ChunkType::NOBJ;
     if (magic == MAGIC_NMDL) return ChunkType::NMDL;
     if (magic == MAGIC_NSHP) return ChunkType::NSHP;
@@ -37,6 +38,15 @@ ChunkType EFileParser::GetChunkType(uint32_t magic) {
     if (magic == MAGIC_NFOG) return ChunkType::NFOG;
     if (magic == MAGIC_NMTR) return ChunkType::NMTR;
     if (magic == MAGIC_SONG) return ChunkType::SONG;
+
+    //others
+    if (magic == MAGIC_BOOK) return ChunkType::BOOK;
+    if (magic == MAGIC_PGHD) return ChunkType::PGHD;
+    if (magic == MAGIC_TIM)  return ChunkType::TIM;
+    if (magic == MAGIC_PROG) return ChunkType::PROG;
+    if (magic == MAGIC_CSF)  return ChunkType::CSF;
+    if (magic == MAGIC_FONT) return ChunkType::FONT;
+
     return ChunkType::Unknown;
 }
 

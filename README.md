@@ -4,13 +4,16 @@ A reverse-engineering toolkit for viewing and extracting assets from Eternal Son
 
 ## Overview
 
-Eternal Sonata Studio provides low-level access to game files, enabling inspection of textures, 3D models, dialogue text, and internal file structures. This tool was developed through reverse engineering of the game's proprietary formats. The goal is to develop it enough so pretty much anything in the game can be viewed and exported.
+Eternal Sonata Studio provides low-level access to game files, enabling inspection of textures, 3D models, dialogue text, audio, and internal file structures. This tool was developed through reverse engineering of the game's proprietary formats. The goal is to develop it enough so pretty much anything in the game can be viewed and exported.
 
 ## Features
 
 ### File Parsing
 - Parse .e container files (maps, cutscenes, models)
-- Chunk-based file structure inspection (NSHP, NTX3, NOBJ, NCAM, NLIT, NMTR)
+- Parse .bop container files
+- Parse .bmd and .camp container files with full section table support
+- NOBJ sub-container parsing — finds all nested chunks (NTX3, NSHP, NMTN, etc.) at any depth
+- Chunk-based file structure inspection (NSHP, NTX3, NOBJ, NMDL, NMTN, NCAM, NLIT, NMTR, NFOG, CSF, FONT)
 - Hex viewer for raw binary data analysis
 
 ### Texture Viewing
@@ -18,6 +21,13 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 - P3TEX texture archive browsing
 - Grid and detail viewing modes
 - Texture dimensions: 16x16 to 4096x4096
+- PNG export with proper transparency (0xEE fill regions exported as alpha=0)
+- Works across .e, .bop, .bmd, and .camp files
+
+### Audio
+- CSF audio container parsing
+- Export to .at3 (ATRAC3) for playback with compatible software
+- Batch export of all audio tracks from a file
 
 ### 3D Model Viewing
 - NSHP mesh format parser
@@ -30,6 +40,11 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 - Automatic filtering of technical strings
 - Support for text markers (<w>, \n)
 - Character name detection
+
+### Scene Data
+- Camera parser (position, rotation, FOV)
+- Light parser (type, color, intensity)
+- Fog and material parsers
 
 ## Build Requirements
 
@@ -78,12 +93,25 @@ Container format holding multiple chunks. Each chunk has:
 - 4-byte size field
 - Variable-length data payload
 
+### .bop Files
+Same chunk structure as .e files. Used for character and object data.
+
+### .bmd / .camp Files
+Higher-level container with a section table. Supported layouts:
+- Direct section table at 0x10 (e.g. appkeep.bmd)
+- Leading section offset at 0x0C followed by table at 0x10 (e.g. characterphoto.bmd, camp_char.bmd)
+- NOBJ sub-containers holding nested model data (e.g. appkeep2.bmd)
+
 ### NTX3 Chunks
 Texture data with DXT1 or DXT5 compression.
 - Header: 128 bytes
-- Dimensions: 16-bit big-endian at offset 0x20-0x23
+- Dimensions: 16-bit big-endian at offsets 0x20 and 0x22
 - Format byte at offset 0x18 (0x86 = DXT1, other = DXT5)
 - Compressed data follows header
+
+### CSF Chunks
+Audio container holding ATRAC3 streams.
+- Exportable to .at3 for playback with compatible players
 
 ### NSHP Chunks
 3D mesh geometry.
@@ -109,27 +137,33 @@ eternal-sonata-studio/
 │   ├── main.cpp
 │   ├── Application.cpp
 │   └── ...
-├── external/           # Third-party dependencies
+├── libs/           # Third-party dependencies
 └── CMakeLists.txt      # Build configuration
 ```
 
 ## Known Limitations
 
-- Animation data (NMTN) is not yet fully parsed
-- Audio files (CSF) are not supported
+- Animation data (NMTN) is parsed and listed but not yet visualised
 - Xbox 360 specific compression not implemented
 - Material export not available
+- Problem with mipmaps (expect a fix later)
 
 ## Technical Notes
 
 ### Texture Decompression
-DXT1 and DXT5 textures are decompressed on-the-fly using the bcdec library. Decompressed RGBA data is cached in GPU memory for performance.
+DXT1 and DXT5 textures are decompressed on-the-fly using the bcdec library. Decompressed RGBA data is cached in GPU memory for performance. PNG exports apply transparency to fill regions (0xEE-padded blocks) so exported files are clean.
+
+### Container Parsing
+BMD and CAMP files use two distinct header layouts depending on the file. The parser auto-detects which layout is in use based on the value at offset 0x0C. NOBJ sub-containers (used in some BMD files) are parsed with the same byte-scan approach as .e files, finding all chunks at any nesting depth.
 
 ### Mesh Rendering
 NSHP meshes are parsed into vertex/index buffers and rendered using OpenGL 4.5 core profile. Camera uses arcball rotation for intuitive 3D navigation.
 
 ### Text Encoding
 Game text uses ASCII encoding with custom markup tags (<w> for wait, \n for line breaks). Character names are hard-coded for detection.
+
+### Audio Export
+CSF containers hold ATRAC3 audio data. The exporter strips the CSF framing and writes a standard .at3 file compatible with PS3 audio tools and foobar2000 with the appropriate plugin.
 
 ## License
 
@@ -140,7 +174,6 @@ This project is for educational and preservation purposes. All game assets remai
 ## Contributing
 
 Pull requests are welcome. For major changes, please open an issue first to discuss proposed modifications.
-
 
 ## Contact
 

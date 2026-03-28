@@ -4,16 +4,22 @@
 #include <cstdint>
 #include <cstring>
 
-constexpr uint32_t MAGIC_NOBJ = 0x4A424F4E;  // "NOBJ"
-constexpr uint32_t MAGIC_NMDL = 0x4C444D4E;  // "NMDL"
-constexpr uint32_t MAGIC_NSHP = 0x5048534E;  // "NSHP"
-constexpr uint32_t MAGIC_NTX3 = 0x3358544E;  // "NTX3"
-constexpr uint32_t MAGIC_NMTN = 0x4E544D4E;  // "NMTN"
-constexpr uint32_t MAGIC_NCAM = 0x4D41434E;  // "NCAM"
-constexpr uint32_t MAGIC_NLIT = 0x54494C4E;  // "NLIT"
-constexpr uint32_t MAGIC_NFOG = 0x474F464E;  // "NFOG"
-constexpr uint32_t MAGIC_NMTR = 0x52544D4E;  // "NMTR"
-constexpr uint32_t MAGIC_SONG = 0x474E4F53;  // "SONG"
+constexpr uint32_t MAGIC_NOBJ = 0x4A424F4E;
+constexpr uint32_t MAGIC_NMDL = 0x4C444D4E;
+constexpr uint32_t MAGIC_NSHP = 0x5048534E;
+constexpr uint32_t MAGIC_NTX3 = 0x3358544E;
+constexpr uint32_t MAGIC_NMTN = 0x4E544D4E;
+constexpr uint32_t MAGIC_NCAM = 0x4D41434E;
+constexpr uint32_t MAGIC_NLIT = 0x54494C4E;
+constexpr uint32_t MAGIC_NFOG = 0x474F464E;
+constexpr uint32_t MAGIC_NMTR = 0x52544D4E;
+constexpr uint32_t MAGIC_SONG = 0x474E4F53;
+constexpr uint32_t MAGIC_BOOK = 0x4B4F4F42;
+constexpr uint32_t MAGIC_PGHD = 0x44484750;
+constexpr uint32_t MAGIC_TIM = 0x204D4954;
+constexpr uint32_t MAGIC_PROG = 0x474F5250;
+constexpr uint32_t MAGIC_CSF = 0x20465343;
+constexpr uint32_t MAGIC_FONT = 0x544E4F46;
 
 enum class ChunkType {
     Unknown,
@@ -26,7 +32,13 @@ enum class ChunkType {
     NLIT,
     NFOG,
     NMTR,
-    SONG
+    SONG,
+    BOOK,
+    PGHD,
+    TIM,
+    PROG,
+    CSF,
+    FONT
 };
 
 struct Chunk {
@@ -54,6 +66,12 @@ struct Chunk {
         case ChunkType::NFOG: return "NFOG";
         case ChunkType::NMTR: return "NMTR";
         case ChunkType::SONG: return "SONG";
+        case ChunkType::BOOK: return "BOOK";
+        case ChunkType::PGHD: return "PGHD";
+        case ChunkType::TIM:  return "TIM";
+        case ChunkType::PROG: return "PROG";
+        case ChunkType::CSF:  return "CSF";
+        case ChunkType::FONT: return "FONT";
         default: return "????";
         }
     }
@@ -70,6 +88,12 @@ struct Chunk {
         case ChunkType::NFOG: return "Fog";
         case ChunkType::NMTR: return "Material";
         case ChunkType::SONG: return "Audio/Music";
+        case ChunkType::BOOK: return "Container";
+        case ChunkType::PGHD: return "Polygon Header";
+        case ChunkType::TIM:  return "Texture Info";
+        case ChunkType::PROG: return "Program";
+        case ChunkType::CSF:  return "Audio Container";
+        case ChunkType::FONT: return "Font Data";
         default: return "Unknown";
         }
     }

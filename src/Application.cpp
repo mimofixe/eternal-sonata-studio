@@ -7,6 +7,8 @@
 #include <iostream>
 #include <fstream>
 #include "EFileParser.h"
+#include "BOPParser.h"
+#include "ContainerParser.h"
 #include "FileDialog.h"
 #include "FileSystemBrowser.h"
 #include "ChunkInspector.h"
@@ -72,16 +74,18 @@ void Application::Run() {
     P3TexViewer tex_viewer;
     EFileTextureViewer efile_tex_viewer;
     EFileTextExtractor text_extractor;
-    CSFViewer csf_viewer;  // CSF Viewer local
+    CSFViewer csf_viewer;
 
     chunk_inspector.SetViewport(&viewport);
     chunk_inspector.SetP3TexParser(&m_P3TexParser);
     tex_viewer.SetParser(&m_P3TexParser);
 
     std::vector<Chunk> loaded_chunks;
+    std::vector<ContainerSection> container_sections;
     std::vector<uint8_t> current_file_data;
     std::string current_file_path;
     int selected_chunk_idx = -1;
+    bool is_container_file = false;
 
     while (!glfwWindowShouldClose(window) && m_Running) {
         glfwPollEvents();
@@ -109,7 +113,6 @@ void Application::Run() {
             ImGui::EndMainMenuBar();
         }
 
-        // Texture Archive (P3TEX)
         ImGui::Begin("Texture Archive (P3TEX)");
 
         if (ImGui::Button("Load P3TEX...", ImVec2(200, 0))) {
@@ -146,27 +149,22 @@ void Application::Run() {
 
         ImGui::End();
 
-        // P3TEX Texture Viewer
         ImGui::Begin("Texture Viewer (P3TEX)");
         tex_viewer.Render();
         ImGui::End();
 
-        // .E FILE Texture Viewer
-        ImGui::Begin("File Textures (.e)");
+        ImGui::Begin("File Textures (.e / .bop / .bmd)");
         efile_tex_viewer.Render();
         ImGui::End();
 
-        // .E FILE Text Viewer
-        ImGui::Begin("File Text (.e)");
+        ImGui::Begin("File Text (.e / .bop / .bmd)");
         text_extractor.Render();
         ImGui::End();
 
-        // CSF Audio Viewer 
         ImGui::Begin("CSF Audio Viewer");
         csf_viewer.Render();
         ImGui::End();
 
-        // File Browser
         ImGui::Begin("File Browser");
         file_browser.Render();
 
@@ -175,24 +173,56 @@ void Application::Run() {
             if (new_file != current_file_path) {
                 current_file_path = new_file;
 
-                // detect file type and load
                 std::string extension;
                 size_t dot_pos = current_file_path.find_last_of('.');
                 if (dot_pos != std::string::npos) {
                     extension = current_file_path.substr(dot_pos);
-                    // Converter para lowercase
                     for (char& c : extension) {
                         c = std::tolower(c);
                     }
                 }
 
-                // if it is csf load in csf viewer
+                loaded_chunks.clear();
+                container_sections.clear();
+                is_container_file = false;
+
                 if (extension == ".csf") {
                     csf_viewer.LoadFile(current_file_path);
                 }
-                // if it's e load normally
-                else if (extension == ".e") {
-                    loaded_chunks = EFileParser::Parse(current_file_path);
+                else if (extension == ".bmd") {
+                    auto container = ContainerParser::Parse(current_file_path);
+
+                    if (container.type != ContainerType::Unknown) {
+                        container_sections = container.sections;
+                        loaded_chunks = container.all_chunks;
+                        is_container_file = true;
+
+                        std::ifstream file(current_file_path, std::ios::binary);
+                        if (file) {
+                            file.seekg(0, std::ios::end);
+                            size_t size = file.tellg();
+                            file.seekg(0);
+                            current_file_data.resize(size);
+                            file.read((char*)current_file_data.data(), size);
+                        }
+
+                        selected_chunk_idx = -1;
+
+                        efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
+                        text_extractor.LoadFromFile(current_file_data);
+
+                        if (container.has_csf) {
+                            csf_viewer.LoadFile(current_file_path);
+                        }
+                    }
+                }
+                else if (extension == ".e" || extension == ".bop") {
+                    if (extension == ".bop") {
+                        loaded_chunks = BOPParser::Parse(current_file_path);
+                    }
+                    else {
+                        loaded_chunks = EFileParser::Parse(current_file_path);
+                    }
 
                     std::ifstream file(current_file_path, std::ios::binary);
                     if (file) {
@@ -206,7 +236,6 @@ void Application::Run() {
 
                     selected_chunk_idx = -1;
 
-                    // update viewer
                     efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
                     text_extractor.LoadFromFile(current_file_data);
                 }
@@ -214,7 +243,6 @@ void Application::Run() {
         }
         ImGui::End();
 
-        // Chunks
         ImGui::Begin("Chunks");
         if (loaded_chunks.empty()) {
             ImGui::TextDisabled("No file loaded");
@@ -222,81 +250,202 @@ void Application::Run() {
         else {
             ImGui::Text("File: %s", current_file_path.c_str());
             ImGui::Text("Total Chunks: %d", (int)loaded_chunks.size());
+
+            if (is_container_file) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 1.0f, 1.0f),
+                    "(BMD Container: %d sections)", (int)container_sections.size());
+            }
+
             ImGui::Separator();
 
             if (ImGui::BeginTable("ChunkList", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
-                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 60);
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 80);
                 ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 80);
                 ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 80);
                 ImGui::TableHeadersRow();
 
-                for (int i = 0; i < (int)loaded_chunks.size(); i++) {
-                    const Chunk& chunk = loaded_chunks[i];
-                    ImGui::TableNextRow();
+                if (is_container_file && !container_sections.empty()) {
+                    int chunk_global_idx = 0;
 
-                    ImGuiSelectableFlags flags = ImGuiSelectableFlags_SpanAllColumns;
-                    ImGui::TableSetColumnIndex(0);
+                    for (size_t sec_idx = 0; sec_idx < container_sections.size(); sec_idx++) {
+                        const auto& section = container_sections[sec_idx];
 
-                    if (ImGui::Selectable(("##chunk" + std::to_string(i)).c_str(), selected_chunk_idx == i, flags)) {
-                        selected_chunk_idx = i;
-                        chunk_inspector.SetChunk(chunk, current_file_data);
+                        if (section.type == "mefc") {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 1.0f, 1.0f, 1.0f));
+                            bool node_open = ImGui::TreeNodeEx(
+                                (void*)(intptr_t)sec_idx,
+                                ImGuiTreeNodeFlags_SpanFullWidth,
+                                "Mefc"
+                            );
+                            ImGui::PopStyleColor();
+
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("%s (%d chunks)", section.mefc_name.c_str(), (int)section.chunks.size());
+
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("0x%zX", section.offset);
+
+                            ImGui::TableSetColumnIndex(3);
+                            FormatSize(section.size);
+
+                            if (node_open) {
+                                for (const auto& chunk : section.chunks) {
+                                    ImGui::TableNextRow();
+
+                                    ImGuiSelectableFlags flags = ImGuiSelectableFlags_SpanAllColumns;
+                                    ImGui::TableSetColumnIndex(0);
+
+                                    if (ImGui::Selectable(("##chunk" + std::to_string(chunk_global_idx)).c_str(),
+                                        selected_chunk_idx == chunk_global_idx, flags)) {
+                                        selected_chunk_idx = chunk_global_idx;
+                                        chunk_inspector.SetChunk(chunk, current_file_data);
+                                    }
+
+                                    ImGui::SameLine();
+                                    ImGui::Indent();
+
+                                    ImVec4 color = GetChunkColor(chunk.type);
+                                    ImGui::TextColored(color, "%s", chunk.GetTypeString().c_str());
+                                    ImGui::Unindent();
+
+                                    ImGui::TableSetColumnIndex(1);
+                                    ImGui::Text("%s", chunk.name);
+
+                                    ImGui::TableSetColumnIndex(2);
+                                    ImGui::Text("0x%zX", chunk.offset);
+
+                                    ImGui::TableSetColumnIndex(3);
+                                    FormatSize(chunk.size);
+
+                                    chunk_global_idx++;
+                                }
+                                ImGui::TreePop();
+                            }
+                            else {
+                                chunk_global_idx += section.chunks.size();
+                            }
+                        }
+                        else if (section.type == "nobj") {
+                            // NOBJ is a sub-container (like Mefc). Show as a collapsible
+                            // tree node; the NTX3/NMTN/etc. chunks inside are the children.
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 1.0f, 1.0f));
+                            bool node_open = ImGui::TreeNodeEx(
+                                (void*)(intptr_t)sec_idx,
+                                ImGuiTreeNodeFlags_SpanFullWidth,
+                                "NOBJ"
+                            );
+                            ImGui::PopStyleColor();
+
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("Object Container (%d chunks)", (int)section.chunks.size());
+
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("0x%zX", section.offset);
+
+                            ImGui::TableSetColumnIndex(3);
+                            FormatSize(section.size);
+
+                            if (node_open) {
+                                for (const auto& chunk : section.chunks) {
+                                    ImGui::TableNextRow();
+
+                                    ImGuiSelectableFlags flags = ImGuiSelectableFlags_SpanAllColumns;
+                                    ImGui::TableSetColumnIndex(0);
+
+                                    if (ImGui::Selectable(("##chunk" + std::to_string(chunk_global_idx)).c_str(),
+                                        selected_chunk_idx == chunk_global_idx, flags)) {
+                                        selected_chunk_idx = chunk_global_idx;
+                                        chunk_inspector.SetChunk(chunk, current_file_data);
+                                    }
+
+                                    ImGui::SameLine();
+                                    ImGui::Indent();
+
+                                    ImVec4 color = GetChunkColor(chunk.type);
+                                    ImGui::TextColored(color, "%s", chunk.GetTypeString().c_str());
+                                    ImGui::Unindent();
+
+                                    ImGui::TableSetColumnIndex(1);
+                                    ImGui::Text("%s", chunk.name);
+
+                                    ImGui::TableSetColumnIndex(2);
+                                    ImGui::Text("0x%zX", chunk.offset);
+
+                                    ImGui::TableSetColumnIndex(3);
+                                    FormatSize(chunk.size);
+
+                                    chunk_global_idx++;
+                                }
+                                ImGui::TreePop();
+                            }
+                            else {
+                                chunk_global_idx += section.chunks.size();
+                            }
+                        }
+                        else {
+                            const auto& chunk = section.chunk;
+
+                            ImGui::TableNextRow();
+
+                            ImGuiSelectableFlags flags = ImGuiSelectableFlags_SpanAllColumns;
+                            ImGui::TableSetColumnIndex(0);
+
+                            if (ImGui::Selectable(("##chunk" + std::to_string(chunk_global_idx)).c_str(),
+                                selected_chunk_idx == chunk_global_idx, flags)) {
+                                selected_chunk_idx = chunk_global_idx;
+                                chunk_inspector.SetChunk(chunk, current_file_data);
+                            }
+
+                            ImGui::SameLine();
+                            ImVec4 color = GetChunkColor(chunk.type);
+                            ImGui::TextColored(color, "%s", chunk.GetTypeString().c_str());
+
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("%s", chunk.name);
+
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("0x%zX", chunk.offset);
+
+                            ImGui::TableSetColumnIndex(3);
+                            FormatSize(chunk.size);
+
+                            chunk_global_idx++;
+                        }
                     }
+                }
+                else {
+                    for (int i = 0; i < (int)loaded_chunks.size(); i++) {
+                        const Chunk& chunk = loaded_chunks[i];
+                        ImGui::TableNextRow();
 
-                    ImGui::SameLine();
-                    ImVec4 color;
-                    switch (chunk.type) {
-                    case ChunkType::NSHP:
-                        color = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
-                        break;
-                    case ChunkType::NOBJ:
-                        color = ImVec4(0.4f, 0.4f, 1.0f, 1.0f);
-                        break;
-                    case ChunkType::NMDL:
-                        color = ImVec4(1.0f, 0.8f, 0.4f, 1.0f);
-                        break;
-                    case ChunkType::NTX3:
-                        color = ImVec4(1.0f, 0.4f, 1.0f, 1.0f);
-                        break;
-                    case ChunkType::NMTN:
-                        color = ImVec4(0.4f, 1.0f, 1.0f, 1.0f);
-                        break;
-                    case ChunkType::NCAM:
-                        color = ImVec4(1.0f, 1.0f, 0.4f, 1.0f);
-                        break;
-                    case ChunkType::NLIT:
-                        color = ImVec4(1.0f, 1.0f, 0.8f, 1.0f);
-                        break;
-                    case ChunkType::NFOG:
-                        color = ImVec4(0.7f, 0.7f, 0.9f, 1.0f);
-                        break;
-                    case ChunkType::NMTR:
-                        color = ImVec4(1.0f, 0.6f, 0.2f, 1.0f);
-                        break;
-                    case ChunkType::SONG:
-                        color = ImVec4(0.8f, 0.4f, 0.8f, 1.0f);
-                        break;
-                    default:
-                        color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-                        break;
-                    }
-                    ImGui::TextColored(color, "%s", chunk.GetTypeString().c_str());
+                        ImGuiSelectableFlags flags = ImGuiSelectableFlags_SpanAllColumns;
+                        ImGui::TableSetColumnIndex(0);
 
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::Text("%s", chunk.name);
+                        if (ImGui::Selectable(("##chunk" + std::to_string(i)).c_str(), selected_chunk_idx == i, flags)) {
+                            selected_chunk_idx = i;
+                            chunk_inspector.SetChunk(chunk, current_file_data);
+                        }
 
-                    ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("0x%zX", chunk.offset);
+                        ImGui::SameLine();
+                        ImVec4 color = GetChunkColor(chunk.type);
+                        ImGui::TextColored(color, "%s", chunk.GetTypeString().c_str());
 
-                    ImGui::TableSetColumnIndex(3);
-                    if (chunk.size < 1024) {
-                        ImGui::Text("%u B", chunk.size);
-                    }
-                    else if (chunk.size < 1024 * 1024) {
-                        ImGui::Text("%.1f KB", chunk.size / 1024.0f);
-                    }
-                    else {
-                        ImGui::Text("%.2f MB", chunk.size / (1024.0f * 1024.0f));
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%s", chunk.name);
+
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::Text("0x%zX", chunk.offset);
+
+                        ImGui::TableSetColumnIndex(3);
+                        FormatSize(chunk.size);
                     }
                 }
 
@@ -305,15 +454,12 @@ void Application::Run() {
         }
         ImGui::End();
 
-        // Inspector
         ImGui::Begin("Inspector");
         chunk_inspector.Render();
         ImGui::End();
 
-        // 3D Viewport
         viewport.Render();
 
-  
         ImGui::Render();
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
@@ -334,4 +480,55 @@ void Application::Run() {
 
 void Application::Shutdown() {
     m_Running = false;
+}
+
+ImVec4 Application::GetChunkColor(ChunkType type) {
+    switch (type) {
+    case ChunkType::NSHP:
+        return ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
+    case ChunkType::NOBJ:
+        return ImVec4(0.4f, 0.4f, 1.0f, 1.0f);
+    case ChunkType::NMDL:
+        return ImVec4(1.0f, 0.8f, 0.4f, 1.0f);
+    case ChunkType::NTX3:
+        return ImVec4(1.0f, 0.4f, 1.0f, 1.0f);
+    case ChunkType::NMTN:
+        return ImVec4(0.4f, 1.0f, 1.0f, 1.0f);
+    case ChunkType::NCAM:
+        return ImVec4(1.0f, 1.0f, 0.4f, 1.0f);
+    case ChunkType::NLIT:
+        return ImVec4(1.0f, 1.0f, 0.8f, 1.0f);
+    case ChunkType::NFOG:
+        return ImVec4(0.7f, 0.7f, 0.9f, 1.0f);
+    case ChunkType::NMTR:
+        return ImVec4(1.0f, 0.6f, 0.2f, 1.0f);
+    case ChunkType::SONG:
+        return ImVec4(0.8f, 0.4f, 0.8f, 1.0f);
+    case ChunkType::BOOK:
+        return ImVec4(0.6f, 0.8f, 0.6f, 1.0f);
+    case ChunkType::PGHD:
+        return ImVec4(0.8f, 0.6f, 0.4f, 1.0f);
+    case ChunkType::TIM:
+        return ImVec4(0.9f, 0.5f, 0.9f, 1.0f);
+    case ChunkType::PROG:
+        return ImVec4(0.5f, 0.9f, 0.9f, 1.0f);
+    case ChunkType::CSF:
+        return ImVec4(1.0f, 0.7f, 0.3f, 1.0f);
+    case ChunkType::FONT:
+        return ImVec4(0.9f, 0.9f, 0.5f, 1.0f);
+    default:
+        return ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+    }
+}
+
+void Application::FormatSize(uint32_t size) {
+    if (size < 1024) {
+        ImGui::Text("%u B", size);
+    }
+    else if (size < 1024 * 1024) {
+        ImGui::Text("%.1f KB", size / 1024.0f);
+    }
+    else {
+        ImGui::Text("%.2f MB", size / (1024.0f * 1024.0f));
+    }
 }

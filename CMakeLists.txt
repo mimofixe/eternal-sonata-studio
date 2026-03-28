@@ -56,6 +56,8 @@ add_executable(es_studio
     src/CSFParser.cpp
     src/ATRAC3Writer.cpp
     src/CSFViewer.cpp
+    src/ContainerParser.cpp
+    src/NTX3Parser.cpp
 )
 
 target_link_libraries(es_studio PRIVATE

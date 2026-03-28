@@ -1,6 +1,8 @@
 ﻿#pragma once
 #include <string>
-#include "P3TexParser.h"  
+#include <imgui.h>
+#include "P3TexParser.h"
+#include "EFileParser.h"
 
 struct AppConfig {
     int width = 1920;
@@ -20,5 +22,8 @@ public:
 private:
     AppConfig m_Config;
     bool m_Running;
-    P3TexParser m_P3TexParser;  
+    P3TexParser m_P3TexParser;
+
+    ImVec4 GetChunkColor(ChunkType type);
+    void FormatSize(uint32_t size);
 };

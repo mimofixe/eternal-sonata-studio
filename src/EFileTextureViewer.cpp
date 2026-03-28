@@ -6,7 +6,6 @@
 #include <cstring>
 #include <filesystem>
 
-// NOTA: STB_IMAGE_WRITE_IMPLEMENTATION está definido em P3TexViewer.cpp
 #include "../libs/stb/stb_image_write.h"
 
 namespace fs = std::filesystem;
@@ -379,6 +378,41 @@ void EFileTextureViewer::ExportTexturePNG(size_t textureIdx) {
     }
     else {
         rgba = P3TexParser::DecompressDXT5(tex.data.data(), tex.width, tex.height);
+    }
+
+    // For PNG export: make 0xEE fill blocks transparent (alpha=0).
+    // These are intentional padding regions the game never renders.
+    // All 16 raw DXT bytes being 0xEE is unambiguous — no real artwork
+    // ever produces that pattern. The viewer keeps them visible (golden-yellow)
+    // so you can see the raw texture data; the exported file gets clean alpha.
+    if (!rgba.empty()) {
+        int block_size = (tex.format == 0x86) ? 8 : 16;
+        int bx_count = tex.width / 4;
+        int by_count = tex.height / 4;
+
+        for (int by = 0; by < by_count; by++) {
+            for (int bx = 0; bx < bx_count; bx++) {
+                int src_byte = (by * bx_count + bx) * block_size;
+                if (src_byte + block_size > static_cast<int>(tex.data.size())) break;
+
+                bool all_ee = true;
+                for (int k = 0; k < block_size; k++) {
+                    if (tex.data[src_byte + k] != 0xEE) { all_ee = false; break; }
+                }
+
+                if (all_ee) {
+                    for (int py = 0; py < 4 && (by * 4 + py) < tex.height; py++) {
+                        for (int px = 0; px < 4 && (bx * 4 + px) < tex.width; px++) {
+                            int dst = ((by * 4 + py) * tex.width + (bx * 4 + px)) * 4;
+                            rgba[dst + 0] = 0;
+                            rgba[dst + 1] = 0;
+                            rgba[dst + 2] = 0;
+                            rgba[dst + 3] = 0;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if (rgba.empty()) {
