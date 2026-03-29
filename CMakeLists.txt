@@ -61,6 +61,8 @@ add_executable(es_studio
     src/Texparser.cpp
     src/AIScriptParser.cpp
     src/AIScriptViewer.cpp
+    src/Tutorialparser.cpp
+    src/Tutorialviewer.cpp
 )
 
 target_link_libraries(es_studio PRIVATE

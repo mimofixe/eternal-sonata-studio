@@ -13,6 +13,8 @@
 #include "TEXParser.h"
 #include "AIScriptParser.h"
 #include "AIScriptViewer.h"
+#include "TutorialParser.h"
+#include "TutorialViewer.h"
 #include "FileDialog.h"
 #include "FileSystemBrowser.h"
 #include "ChunkInspector.h"
@@ -80,6 +82,7 @@ void Application::Run() {
     EFileTextExtractor text_extractor;
     CSFViewer csf_viewer;
     AIScriptViewer ai_script_viewer;
+    TutorialViewer tutorial_viewer;
 
     chunk_inspector.SetViewport(&viewport);
     chunk_inspector.SetP3TexParser(&m_P3TexParser);
@@ -177,6 +180,10 @@ void Application::Run() {
         ai_script_viewer.Render();
         ImGui::End();
 
+        ImGui::Begin("Tutorial Viewer");
+        tutorial_viewer.Render();
+        ImGui::End();
+
         ImGui::Begin("File Browser");
         file_browser.Render();
 
@@ -230,24 +237,27 @@ void Application::Run() {
                     }
                 }
                 else if (extension == ".e" || extension == ".bop" || extension == ".p3obj") {
-                    // .e files can be either AI scripts (magic 0x00000181) or model files (NOBJ)
-                    bool is_ai_script = false;
+                    // Read enough header bytes to distinguish tutorial vs AI script vs container
+                    uint8_t hdr[0x18] = {};
                     {
                         std::ifstream probe(current_file_path, std::ios::binary);
-                        if (probe) {
-                            uint8_t hdr[4] = { 0, 0, 0, 0 };
-                            probe.read(reinterpret_cast<char*>(hdr), 4);
-                            if (probe.gcount() >= 4) {
-                                is_ai_script = AIScriptParser::IsAIScript(hdr, 4);
-                            }
-                        }
+                        if (probe) probe.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
                     }
 
-                    if (is_ai_script) {
+                    if (TutorialParser::IsTutorialFile(hdr, sizeof(hdr))) {
+                        tutorial_viewer.Load(current_file_path);
+                        ai_script_viewer.Clear();
+                        selected_chunk_idx = -1;
+                    }
+                    else if (AIScriptParser::IsAIScript(hdr, sizeof(hdr))) {
                         ai_script_viewer.Load(current_file_path);
+                        tutorial_viewer.Clear();
                         selected_chunk_idx = -1;
                     }
                     else {
+                        ai_script_viewer.Clear();
+                        tutorial_viewer.Clear();
+
                         if (extension == ".bop") {
                             loaded_chunks = BOPParser::Parse(current_file_path);
                         }

@@ -13,8 +13,12 @@ float AIScriptParser::ReadF32BE(const uint8_t* d) {
     uint32_t u = ReadU32BE(d); float f; memcpy(&f, &u, 4); return f;
 }
 bool AIScriptParser::IsAIScript(const uint8_t* data, size_t size) {
-    if (size < 4) return false;
-    return ReadU32BE(data) == AI_SCRIPT_MAGIC;
+    if (size < 0x18) return false;
+    if (ReadU32BE(data) != AI_SCRIPT_MAGIC) return false;
+    // node_count at 0x14 must be in the range seen across all 120 known AI files (114–600)
+    // Container .e files with the same magic have node_count in the millions
+    uint32_t node_count = ReadU32BE(data + 0x14);
+    return node_count > 0 && node_count <= 2000;
 }
 
 // Named globals
@@ -136,7 +140,7 @@ std::string AIScriptParser::ApiMeaning(uint32_t addr, int call_count, bool is_co
     if (addr == 0)
         return "execute_action()  [reads g_special_slot → dispatch]";
 
-    //Group A: boss/simple-enemy special abilities
+    // ── Group A: boss/simple-enemy special abilities ─────────
     if (addr == 0x0021F0) return "default_special_ability()";
     if (addr == 0x0022B8) return "bos13_special_ability()";
     if (addr == 0x002358) return "bos09_special_ability()";
@@ -165,7 +169,7 @@ std::string AIScriptParser::ApiMeaning(uint32_t addr, int call_count, bool is_co
     if (addr == 0x002B28) return "boscpn_special_ability()";
     if (addr == 0x002B70) return "bosfga2_special_ability()";
 
-    // complex-enemy function tables
+    // ── Group B: complex-enemy function tables ───────────────
     // em12 (some unique maths functions)
     if (addr == 0x002FB0) return "em12_math_fn_A()";
     if (addr == 0x002FB4) return "em12_math_fn_B()";
@@ -308,7 +312,7 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
     uint8_t b = safe(0);
     int len = 1;
 
-    //0x81 extended prefix
+    // ── 0x81 extended prefix ────────────────────────────────────
     if (b == 0x81) {
         uint8_t sub = safe(1);
         switch (sub) {
@@ -409,7 +413,7 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
         }
     }
 
-    //Standalone 0x09 XX = PUSH_ADDR &g[XX] (write mode)
+    // ── Standalone 0x09 XX = PUSH_ADDR &g[XX] (write mode) ─────
     else if (b == 0x09) {
         uint8_t reg = safe(1);
         out.mnemonic = "PUSH_ADDR";
@@ -421,7 +425,7 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
         len = 2;
     }
 
-    //0x08 FF FF FF XX = PUSH_ADDR &g_shared[XX]
+    // ── 0x08 FF FF FF XX = PUSH_ADDR &g_shared[XX] ──────────────
     else if (b == 0x08 &&
         safe(1) == 0xFF && safe(2) == 0xFF && safe(3) == 0xFF) {
         uint8_t addr = safe(4);
@@ -431,7 +435,7 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
         len = 5;
     }
 
-    //Standard control flow
+    // ── Standard control flow ────────────────────────────────────
     else if (b == 0x07) {
         uint32_t addr = u24(1);
         out.mnemonic = "JMP";
@@ -488,29 +492,29 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
         out.is_jump = true; out.target = (pos + 2 > back) ? (pos + 2 - back) : 0; len = 2;
     }
 
-    //0x7D = RETURN
+    // ── 0x7D = RETURN ────────────────────────────────────────────
     else if (b == 0x7D) {
         uint32_t v = u32(1);
         out.mnemonic = "RETURN";
         out.operand = (v == 0) ? "FAIL" : (v == 1 ? "SUCCESS" : std::to_string(v));
         len = 5;
     }
-    //0x7C = MASK
+    // ── 0x7C = MASK ──────────────────────────────────────────────
     else if (b == 0x7C) {
         char buf[8]; snprintf(buf, 8, "#%02X", safe(1));
         out.mnemonic = "MASK"; out.operand = buf; len = 2;
     }
 
-    //Branch-tree conditionals
+    // ── Branch-tree conditionals ─────────────────────────────────
     else if (b == 0x85) { out.mnemonic = "IFTRUE";  out.operand = ""; len = 1; }
     else if (b == 0x86) { out.mnemonic = "IFFALSE"; out.operand = ""; len = 1; }
     else if (b == 0x87) { out.mnemonic = "IFEITH";  out.operand = ""; len = 1; }
 
-    //Result retrieval
+    // ── Result retrieval ─────────────────────────────────────────
     else if (b == 0x98) { out.mnemonic = "GETRES";     out.operand = ""; len = 1; }
-    else if (b == 0x9A) { out.mnemonic = "GETRES_ALT"; out.operand = ""; len = 1; } 
+    else if (b == 0x9A) { out.mnemonic = "GETRES_ALT"; out.operand = ""; len = 1; } // post-JMPNODE N24
 
-    //0x88 = COND #status
+    // ── 0x88 = COND #status ──────────────────────────────────────
     else if (b == 0x88) {
         uint8_t v = safe(1);
         std::string st = CondStatus(v);
@@ -518,7 +522,7 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
         out.mnemonic = "COND"; out.operand = buf; len = 2;
     }
 
-    //0x89 = SWITCH #XX or GETRES_89
+    // ── 0x89 = SWITCH #XX or GETRES_89 ──────────────────────────
     else if (b == 0x89) {
         if (safe(1) == 0x00 && safe(2) == 0x00 && safe(3) == 0x00) {
             uint8_t n = safe(4);
@@ -532,12 +536,12 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
         }
     }
 
-    //Stack / memory ops
+    // ── Stack / memory ops ───────────────────────────────────────
     else if (b == 0x24) { out.mnemonic = "STORE";  out.operand = ""; len = 1; }
     else if (b == 0x32) { out.mnemonic = "MOV";    out.operand = ""; len = 1; }
     else if (b == 0x33) { out.mnemonic = "MOVC";   out.operand = ""; len = 1; }
 
-    //Comparisons
+    // ── Comparisons ──────────────────────────────────────────────
     else if (b == 0x22) { out.mnemonic = "EQ";  out.operand = ""; len = 1; }
     else if (b == 0x1E) { out.mnemonic = "NE";  out.operand = ""; len = 1; }
     else if (b == 0x1C) { out.mnemonic = "LT";  out.operand = ""; len = 1; }
@@ -545,26 +549,26 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
     else if (b == 0x2C) { out.mnemonic = "LE";  out.operand = ""; len = 1; }
     else if (b == 0x3E) { out.mnemonic = "CMP"; out.operand = ""; len = 1; }
 
-    //Arithmetic
+    // ── Arithmetic ───────────────────────────────────────────────
     else if (b == 0x3A) { out.mnemonic = "ADD"; out.operand = ""; len = 1; }
     else if (b == 0x35) { out.mnemonic = "SUB"; out.operand = ""; len = 1; }
     else if (b == 0x36) { out.mnemonic = "ABS"; out.operand = ""; len = 1; }
     else if (b == 0x30) { out.mnemonic = "MUL"; out.operand = ""; len = 1; }
 
-    //Bit manipulation
+    // ── Bit manipulation ─────────────────────────────────────────
     else if (b == 0x47) { out.mnemonic = "SETBIT"; out.operand = ""; len = 1; }
     else if (b == 0x49) { out.mnemonic = "CLRBIT"; out.operand = ""; len = 1; }
 
-    //Flow control
+    // ── Flow control ─────────────────────────────────────────────
     else if (b == 0x0C) { out.mnemonic = "YIELD"; out.operand = ""; len = 1; }
 
-    //Timer compare (0x57 XX)
+    // ── Timer compare (0x57 XX) ──────────────────────────────────
     else if (b == 0x57) {
         char buf[16]; snprintf(buf, sizeof(buf), "#%u", safe(1));
         out.mnemonic = "CMP_TIMER"; out.operand = buf; len = 2;
     }
 
-    //Flag and state operations (each takes 1-byte operand)
+    // ── Flag and state operations (each takes 1-byte operand) ────
     else if (b == 0x5D) {
         char buf[8]; snprintf(buf, 8, "#%u", safe(1));
         out.mnemonic = "STFLAG"; out.operand = buf; len = 2;
@@ -602,13 +606,13 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
         out.mnemonic = "TEST"; out.operand = buf; len = 2;
     }
 
-    //0x4F = POPN (pop N values from stack into sequential globals)
+    // ── 0x4F = POPN (pop N values from stack into sequential globals) ──
     else if (b == 0x4F) {
         char buf[8]; snprintf(buf, 8, "#%u", safe(1));
         out.mnemonic = "POPN"; out.operand = buf; len = 2;
     }
 
-    //Fallback 
+    // ── Fallback ─────────────────────────────────────────────────
     else {
         char buf[8]; snprintf(buf, 8, "???_%02X", b);
         out.mnemonic = buf; out.operand = ""; len = 1;
