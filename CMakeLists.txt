@@ -59,6 +59,8 @@ add_executable(es_studio
     src/ContainerParser.cpp
     src/NTX3Parser.cpp
     src/Texparser.cpp
+    src/AIScriptParser.cpp
+    src/AIScriptViewer.cpp
 )
 
 target_link_libraries(es_studio PRIVATE

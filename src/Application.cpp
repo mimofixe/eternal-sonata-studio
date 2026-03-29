@@ -11,6 +11,8 @@
 #include "BOPParser.h"
 #include "ContainerParser.h"
 #include "TEXParser.h"
+#include "AIScriptParser.h"
+#include "AIScriptViewer.h"
 #include "FileDialog.h"
 #include "FileSystemBrowser.h"
 #include "ChunkInspector.h"
@@ -77,6 +79,7 @@ void Application::Run() {
     EFileTextureViewer efile_tex_viewer;
     EFileTextExtractor text_extractor;
     CSFViewer csf_viewer;
+    AIScriptViewer ai_script_viewer;
 
     chunk_inspector.SetViewport(&viewport);
     chunk_inspector.SetP3TexParser(&m_P3TexParser);
@@ -158,16 +161,20 @@ void Application::Run() {
         tex_viewer.Render();
         ImGui::End();
 
-        ImGui::Begin("File Textures (.e / .bop / .bmd)");
+        ImGui::Begin("File Textures (.e / .bop / .bmd / .p3obj)");
         efile_tex_viewer.Render();
         ImGui::End();
 
-        ImGui::Begin("File Text (.e / .bop / .bmd)");
+        ImGui::Begin("File Text (.e / .bop / .bmd / .p3obj)");
         text_extractor.Render();
         ImGui::End();
 
         ImGui::Begin("CSF Audio Viewer");
         csf_viewer.Render();
+        ImGui::End();
+
+        ImGui::Begin("AI Script Viewer");
+        ai_script_viewer.Render();
         ImGui::End();
 
         ImGui::Begin("File Browser");
@@ -222,28 +229,47 @@ void Application::Run() {
                         }
                     }
                 }
-                else if (extension == ".e" || extension == ".bop") {
-                    if (extension == ".bop") {
-                        loaded_chunks = BOPParser::Parse(current_file_path);
+                else if (extension == ".e" || extension == ".bop" || extension == ".p3obj") {
+                    // .e files can be either AI scripts (magic 0x00000181) or model files (NOBJ)
+                    bool is_ai_script = false;
+                    {
+                        std::ifstream probe(current_file_path, std::ios::binary);
+                        if (probe) {
+                            uint8_t hdr[4] = { 0, 0, 0, 0 };
+                            probe.read(reinterpret_cast<char*>(hdr), 4);
+                            if (probe.gcount() >= 4) {
+                                is_ai_script = AIScriptParser::IsAIScript(hdr, 4);
+                            }
+                        }
+                    }
+
+                    if (is_ai_script) {
+                        ai_script_viewer.Load(current_file_path);
+                        selected_chunk_idx = -1;
                     }
                     else {
-                        loaded_chunks = EFileParser::Parse(current_file_path);
+                        if (extension == ".bop") {
+                            loaded_chunks = BOPParser::Parse(current_file_path);
+                        }
+                        else {
+                            loaded_chunks = EFileParser::Parse(current_file_path);
+                        }
+
+                        std::ifstream file(current_file_path, std::ios::binary);
+                        if (file) {
+                            file.seekg(0, std::ios::end);
+                            size_t size = file.tellg();
+                            file.seekg(0, std::ios::beg);
+                            current_file_data.resize(size);
+                            file.read((char*)current_file_data.data(), size);
+                            file.close();
+                        }
+
+                        selected_chunk_idx = -1;
+
+                        efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
+                        text_extractor.LoadFromFile(current_file_data);
                     }
-
-                    std::ifstream file(current_file_path, std::ios::binary);
-                    if (file) {
-                        file.seekg(0, std::ios::end);
-                        size_t size = file.tellg();
-                        file.seekg(0, std::ios::beg);
-                        current_file_data.resize(size);
-                        file.read((char*)current_file_data.data(), size);
-                        file.close();
-                    }
-
-                    selected_chunk_idx = -1;
-
-                    efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
-                    text_extractor.LoadFromFile(current_file_data);
                 }
                 else if (extension == ".tex") {
                     auto tex = TEXParser::Parse(current_file_path);
@@ -647,6 +673,16 @@ ImVec4 Application::GetChunkColor(ChunkType type) {
         return ImVec4(1.0f, 0.4f, 1.0f, 1.0f);
     case ChunkType::NMTN:
         return ImVec4(0.4f, 1.0f, 1.0f, 1.0f);
+    case ChunkType::NMTB:
+        return ImVec4(0.2f, 0.8f, 0.8f, 1.0f);
+    case ChunkType::NBN2:
+        return ImVec4(1.0f, 0.7f, 0.2f, 1.0f);
+    case ChunkType::NDYN:
+        return ImVec4(0.3f, 1.0f, 0.6f, 1.0f);
+    case ChunkType::NLC2:
+        return ImVec4(0.8f, 0.5f, 1.0f, 1.0f);
+    case ChunkType::NCLS:
+        return ImVec4(0.6f, 0.8f, 0.4f, 1.0f);
     case ChunkType::NCAM:
         return ImVec4(1.0f, 1.0f, 0.4f, 1.0f);
     case ChunkType::NLIT:

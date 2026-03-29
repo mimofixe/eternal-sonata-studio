@@ -20,25 +20,35 @@ constexpr uint32_t MAGIC_TIM = 0x204D4954;
 constexpr uint32_t MAGIC_PROG = 0x474F5250;
 constexpr uint32_t MAGIC_CSF = 0x20465343;
 constexpr uint32_t MAGIC_FONT = 0x544E4F46;
+constexpr uint32_t MAGIC_NBN2 = 0x324E424E;  // Bone hierarchy
+constexpr uint32_t MAGIC_NDYN = 0x4E59444E;  // Physics (cloth/hair dynamics)
+constexpr uint32_t MAGIC_NLC2 = 0x32434C4E;  // IK constraint chains
+constexpr uint32_t MAGIC_NCLS = 0x534C434E;  // Skinning clusters
+constexpr uint32_t MAGIC_NMTB = 0x42544D4E;  // Animation bank (motion table)
 
 enum class ChunkType {
     Unknown,
-    NOBJ,
-    NMDL,
-    NSHP,
-    NTX3,
-    NMTN,
-    NCAM,
-    NLIT,
-    NFOG,
-    NMTR,
-    SONG,
-    BOOK,
-    PGHD,
-    TIM,
-    PROG,
-    CSF,
-    FONT
+    NOBJ,   // Object container
+    NMDL,   // Model descriptor
+    NSHP,   // Mesh (vertex + index data)
+    NTX3,   // Texture (DXT1/DXT5)
+    NMTN,   // Animation clip
+    NCAM,   // Camera
+    NLIT,   // Light
+    NFOG,   // Fog
+    NMTR,   // Material
+    SONG,   // Audio
+    BOOK,   // Container
+    PGHD,   // Polygon header
+    TIM,    // Texture info
+    PROG,   // Program/shader
+    CSF,    // Audio container
+    FONT,   // Font data
+    NBN2,   // Bone hierarchy (skeleton)
+    NDYN,   // Dynamic physics (cloth/hair)
+    NLC2,   // IK constraint chains
+    NCLS,   // Skinning cluster map
+    NMTB,   // Motion table (animation bank)
 };
 
 struct Chunk {
@@ -72,6 +82,11 @@ struct Chunk {
         case ChunkType::PROG: return "PROG";
         case ChunkType::CSF:  return "CSF";
         case ChunkType::FONT: return "FONT";
+        case ChunkType::NBN2: return "NBN2";
+        case ChunkType::NDYN: return "NDYN";
+        case ChunkType::NLC2: return "NLC2";
+        case ChunkType::NCLS: return "NCLS";
+        case ChunkType::NMTB: return "NMTB";
         default: return "????";
         }
     }
@@ -79,10 +94,10 @@ struct Chunk {
     std::string GetDescription() const {
         switch (type) {
         case ChunkType::NOBJ: return "Object Container";
-        case ChunkType::NMDL: return "Model Metadata";
-        case ChunkType::NSHP: return "3D Mesh";
+        case ChunkType::NMDL: return "Model Descriptor";
+        case ChunkType::NSHP: return "Mesh";
         case ChunkType::NTX3: return "Texture";
-        case ChunkType::NMTN: return "Animation";
+        case ChunkType::NMTN: return "Animation Clip";
         case ChunkType::NCAM: return "Camera";
         case ChunkType::NLIT: return "Light";
         case ChunkType::NFOG: return "Fog";
@@ -91,9 +106,14 @@ struct Chunk {
         case ChunkType::BOOK: return "Container";
         case ChunkType::PGHD: return "Polygon Header";
         case ChunkType::TIM:  return "Texture Info";
-        case ChunkType::PROG: return "Program";
+        case ChunkType::PROG: return "Program/Shader";
         case ChunkType::CSF:  return "Audio Container";
         case ChunkType::FONT: return "Font Data";
+        case ChunkType::NBN2: return "Bone Hierarchy";
+        case ChunkType::NDYN: return "Physics (cloth/hair)";
+        case ChunkType::NLC2: return "IK Constraints";
+        case ChunkType::NCLS: return "Skinning Clusters";
+        case ChunkType::NMTB: return "Animation Bank";
         default: return "Unknown";
         }
     }
