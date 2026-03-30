@@ -39,13 +39,6 @@ ChunkType EFileParser::GetChunkType(uint32_t magic) {
     if (magic == MAGIC_NMTR) return ChunkType::NMTR;
     if (magic == MAGIC_SONG) return ChunkType::SONG;
 
-    // p3obj / model chunks
-    if (magic == MAGIC_NBN2) return ChunkType::NBN2;
-    if (magic == MAGIC_NDYN) return ChunkType::NDYN;
-    if (magic == MAGIC_NLC2) return ChunkType::NLC2;
-    if (magic == MAGIC_NCLS) return ChunkType::NCLS;
-    if (magic == MAGIC_NMTB) return ChunkType::NMTB;
-
     //others
     if (magic == MAGIC_BOOK) return ChunkType::BOOK;
     if (magic == MAGIC_PGHD) return ChunkType::PGHD;
@@ -53,6 +46,11 @@ ChunkType EFileParser::GetChunkType(uint32_t magic) {
     if (magic == MAGIC_PROG) return ChunkType::PROG;
     if (magic == MAGIC_CSF)  return ChunkType::CSF;
     if (magic == MAGIC_FONT) return ChunkType::FONT;
+    if (magic == MAGIC_NBN2) return ChunkType::NBN2;
+    if (magic == MAGIC_NMTB) return ChunkType::NMTB;
+    if (magic == MAGIC_NDYN) return ChunkType::NDYN;
+    if (magic == MAGIC_NLC2) return ChunkType::NLC2;
+    if (magic == MAGIC_NCLS) return ChunkType::NCLS;
 
     return ChunkType::Unknown;
 }
@@ -81,7 +79,7 @@ std::vector<Chunk> EFileParser::Parse(const std::string& filepath) {
     const uint32_t magics[] = {
         MAGIC_NOBJ, MAGIC_NMDL, MAGIC_NSHP, MAGIC_NTX3, MAGIC_NMTN,
         MAGIC_NCAM, MAGIC_NLIT, MAGIC_NFOG, MAGIC_NMTR, MAGIC_SONG,
-        MAGIC_NBN2, MAGIC_NDYN, MAGIC_NLC2, MAGIC_NCLS, MAGIC_NMTB
+        MAGIC_NBN2, MAGIC_NMTB, MAGIC_NDYN, MAGIC_NLC2, MAGIC_NCLS
     };
 
     for (size_t i = 0; i < fileSize - 64; i++) {
@@ -118,85 +116,44 @@ std::vector<Chunk> EFileParser::Parse(const std::string& filepath) {
                 break;
 
             case ChunkType::NMDL:
-                // Model name at +0x10 (after 8-byte header + 8 bytes of flags)
                 name_start = i + 16;
                 for (size_t j = 0; j < sizeof(chunk.name) - 1 && name_start + j < fileSize; j++) {
-                    if (data[name_start + j] >= 32 && data[name_start + j] < 127)
+                    if (data[name_start + j] >= 32 && data[name_start + j] < 127) {
                         chunk.name[j] = data[name_start + j];
-                    else break;
+                    }
+                    else {
+                        break;
+                    }
                 }
                 break;
 
             case ChunkType::NSHP:
+            case ChunkType::NBN2:
+            case ChunkType::NMTB:
+            case ChunkType::NDYN:
             case ChunkType::NLC2:
-                // Mesh/IK name at +0x08
-                name_start = i + 8;
-                for (size_t j = 0; j < sizeof(chunk.name) - 1 && name_start + j < fileSize; j++) {
-                    if (data[name_start + j] != 0)
-                        chunk.name[j] = data[name_start + j];
-                    else break;
-                }
-                break;
-
-            case ChunkType::NMTN: {
-                // Animation name at +0x10 (not +0x08 — those bytes are flags)
-                // Frame count at +0x20 (u16 BE)
-                name_start = i + 0x10;
-                for (size_t j = 0; j < sizeof(chunk.name) - 1 && name_start + j < fileSize; j++) {
-                    if (data[name_start + j] >= 32 && data[name_start + j] < 127)
-                        chunk.name[j] = data[name_start + j];
-                    else break;
-                }
-                if (chunk.name[0] == '\0') {
-                    snprintf(chunk.name, sizeof(chunk.name), "animation_%zu", chunks.size());
-                }
-                break;
-            }
-
-            case ChunkType::NBN2: {
-                // Bone hierarchy — root bone name at +0x08, bone count = (size-8)/0x40
-                name_start = i + 8;
-                char root_name[9] = { 0 };
-                for (size_t j = 0; j < 8 && name_start + j < fileSize; j++) {
-                    if (data[name_start + j] >= 32 && data[name_start + j] < 127)
-                        root_name[j] = data[name_start + j];
-                    else { root_name[j] = '\0'; break; }
-                }
-                uint32_t bone_count = (chunk.size > 8) ? (chunk.size - 8) / 0x40 : 0;
-                snprintf(chunk.name, sizeof(chunk.name), "%s (%u bones)", root_name, bone_count);
-                break;
-            }
-
-            case ChunkType::NDYN: {
-                // Physics chains — chain count at +0x0A (u16)
-                uint16_t chain_count = 0;
-                if (i + 10 + 2 <= fileSize)
-                    chain_count = ReadU32BE(&data[i + 8]) >> 16; // bytes 0x0A-0x0B
-                // Stiffness at +0x14, mass at +0x1C
-                snprintf(chunk.name, sizeof(chunk.name), "physics (%u chains)", chain_count);
-                break;
-            }
-
             case ChunkType::NCLS:
-                // Skinning cluster — bone-to-mesh assignment table
-                snprintf(chunk.name, sizeof(chunk.name), "skin_clusters");
+            case ChunkType::NMTN:
+                name_start = i + 8;
+                for (size_t j = 0; j < sizeof(chunk.name) - 1 && name_start + j < fileSize; j++) {
+                    if (data[name_start + j] != 0) {
+                        chunk.name[j] = data[name_start + j];
+                    }
+                    else {
+                        break;
+                    }
+                }
                 break;
-
-            case ChunkType::NMTB: {
-                // Motion table — count NMTNs it contains
-                uint16_t anim_count = 0;
-                if (i + 16 <= fileSize)
-                    anim_count = (uint16_t)(ReadU32BE(&data[i + 12]));  // entry count hint
-                snprintf(chunk.name, sizeof(chunk.name), "motion_bank");
-                break;
-            }
 
             case ChunkType::NLIT:
                 name_start = i + 8;
                 for (size_t j = 0; j < sizeof(chunk.name) - 1 && name_start + j < fileSize; j++) {
-                    if (data[name_start + j] >= 32 && data[name_start + j] < 127)
+                    if (data[name_start + j] >= 32 && data[name_start + j] < 127) {
                         chunk.name[j] = data[name_start + j];
-                    else break;
+                    }
+                    else {
+                        break;
+                    }
                 }
                 break;
 
@@ -229,27 +186,27 @@ std::vector<Chunk> EFileParser::Parse(const std::string& filepath) {
         }
     }
 
-    int counts[32] = { 0 };
+    int counts[20] = { 0 };   // sized for all ChunkType values (enum count + margin)
     for (const auto& chunk : chunks) {
-        counts[(int)chunk.type]++;
+        int idx = (int)chunk.type;
+        if (idx >= 0 && idx < 20) counts[idx]++;
     }
 
     std::cout << "\nSummary:" << std::endl;
-    std::cout << "  NOBJ (containers):    " << counts[(int)ChunkType::NOBJ] << std::endl;
-    std::cout << "  NMDL (models):        " << counts[(int)ChunkType::NMDL] << std::endl;
-    std::cout << "  NSHP (meshes):        " << counts[(int)ChunkType::NSHP] << std::endl;
-    std::cout << "  NTX3 (textures):      " << counts[(int)ChunkType::NTX3] << std::endl;
-    std::cout << "  NMTN (animations):    " << counts[(int)ChunkType::NMTN] << std::endl;
-    std::cout << "  NMTB (anim banks):    " << counts[(int)ChunkType::NMTB] << std::endl;
-    std::cout << "  NBN2 (bones):         " << counts[(int)ChunkType::NBN2] << std::endl;
-    std::cout << "  NDYN (physics):       " << counts[(int)ChunkType::NDYN] << std::endl;
-    std::cout << "  NLC2 (IK chains):     " << counts[(int)ChunkType::NLC2] << std::endl;
-    std::cout << "  NCLS (skin clusters): " << counts[(int)ChunkType::NCLS] << std::endl;
-    std::cout << "  NCAM (cameras):       " << counts[(int)ChunkType::NCAM] << std::endl;
-    std::cout << "  NLIT (lights):        " << counts[(int)ChunkType::NLIT] << std::endl;
-    std::cout << "  NFOG (fog):           " << counts[(int)ChunkType::NFOG] << std::endl;
-    std::cout << "  NMTR (materials):     " << counts[(int)ChunkType::NMTR] << std::endl;
-    std::cout << "  SONG (audio):         " << counts[(int)ChunkType::SONG] << std::endl;
+    std::cout << "  NOBJ (containers): " << counts[(int)ChunkType::NOBJ] << std::endl;
+    std::cout << "  NMDL (models): " << counts[(int)ChunkType::NMDL] << std::endl;
+    std::cout << "  NSHP (meshes): " << counts[(int)ChunkType::NSHP] << std::endl;
+    std::cout << "  NTX3 (textures): " << counts[(int)ChunkType::NTX3] << std::endl;
+    std::cout << "  NMTN (animations): " << counts[(int)ChunkType::NMTN] << std::endl;
+    std::cout << "  NBN2 (skeletons): " << counts[(int)ChunkType::NBN2] << std::endl;
+    std::cout << "  NCAM (cameras): " << counts[(int)ChunkType::NCAM] << std::endl;
+    std::cout << "  NLIT (lights): " << counts[(int)ChunkType::NLIT] << std::endl;
+    std::cout << "  NFOG (fog): " << counts[(int)ChunkType::NFOG] << std::endl;
+    std::cout << "  NMTR (materials): " << counts[(int)ChunkType::NMTR] << std::endl;
+    std::cout << "  SONG (audio): " << counts[(int)ChunkType::SONG] << std::endl;
+    std::cout << "  NMTB/NDYN/NLC2/NCLS: "
+        << counts[(int)ChunkType::NMTB] + counts[(int)ChunkType::NDYN]
+        + counts[(int)ChunkType::NLC2] + counts[(int)ChunkType::NCLS] << std::endl;
     std::cout << "  Total: " << chunks.size() << std::endl;
     std::cout << "==================\n" << std::endl;
 

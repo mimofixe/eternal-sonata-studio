@@ -1,6 +1,7 @@
 #pragma once
 #include "EFileParser.h"
 #include "NSHPParser.h"
+#include "NBN2Parser.h"
 #include "Viewport3D.h"
 #include "P3TexParser.h"
 #include "TextureCache.h"
@@ -25,6 +26,7 @@ private:
     void RenderMaterialInfo();
     void RenderAnimationInfo();
     void RenderNTX3Info();
+    void RenderNBN2Info();
     void RenderTextView();
     std::vector<std::string> ExtractStrings(const uint8_t* data, size_t size, size_t min_length = 4);
 
@@ -42,7 +44,7 @@ private:
     TextureCache m_TextureCache;
 
     // Cache para evitar parsing repetido
-    NSHPMesh m_CachedMesh;          
-    bool m_MeshCached;               
-    size_t m_LastChunkOffset;        
+    NSHPMesh m_CachedMesh;
+    bool m_MeshCached;
+    size_t m_LastChunkOffset;
 };

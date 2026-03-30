@@ -92,6 +92,11 @@ void ChunkInspector::Render() {
             ImGui::EndTabItem();
         }
 
+        if (m_CurrentChunk.type == ChunkType::NBN2 && ImGui::BeginTabItem("Skeleton Info")) {
+            RenderNBN2Info();
+            ImGui::EndTabItem();
+        }
+
         if (m_CurrentChunk.type == ChunkType::NCAM && ImGui::BeginTabItem("Camera Info")) {
             RenderCameraInfo();
             ImGui::EndTabItem();
@@ -666,6 +671,71 @@ void ChunkInspector::RenderMaterialInfo() {
         m_MaterialData.ambient_color[1] / 255.0f,
         m_MaterialData.ambient_color[2] / 255.0f, 1.0f);
     ImGui::ColorButton("Ambient", ambient, 0, ImVec2(50, 50));
+}
+
+void ChunkInspector::RenderNBN2Info() {
+    ImGui::Text("Skeleton Bone Data");
+    ImGui::Separator();
+
+    if (m_ChunkData.size() < 72) {
+        ImGui::TextColored(ImVec4(1, 0, 0, 1), "Chunk too small for skeleton");
+        return;
+    }
+
+    // Quick bone count estimate (each bone = 64 bytes, minus 8-byte chunk header)
+    const int est_bones = (int)((m_ChunkData.size() - 8) / 64);
+    ImGui::Text("Estimated bone count: %d", est_bones);
+    ImGui::Spacing();
+
+    if (ImGui::Button("Load Skeleton in Viewport")) {
+        if (m_Viewport) {
+            std::vector<Bone> bones;
+            if (NBN2Parser::Parse(m_ChunkData.data(), m_ChunkData.size(), bones)) {
+                m_Viewport->LoadSkeleton(bones);
+                std::cout << "[ChunkInspector] Skeleton loaded: "
+                    << bones.size() << " bones\n";
+            }
+            else {
+                std::cerr << "[ChunkInspector] NBN2 parse failed\n";
+            }
+        }
+        else {
+            std::cerr << "[ChunkInspector] No viewport set\n";
+        }
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Skeleton")) {
+        if (m_Viewport) m_Viewport->ClearSkeleton();
+    }
+
+    // Show first 30 bones inline
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Text("Bone list (first 30):");
+
+    std::vector<Bone> bones;
+    NBN2Parser::Parse(m_ChunkData.data(), m_ChunkData.size(), bones);
+
+    ImGui::BeginChild("BoneList", ImVec2(0, 300), true);
+    const int show = (int)std::min(bones.size(), size_t(30));
+    for (int i = 0; i < show; i++) {
+        const Bone& b = bones[i];
+        ImVec4 col = b.IsDynamic() ? ImVec4(0.6f, 0.8f, 1.0f, 1.0f)
+            : b.IsEffector() ? ImVec4(0.8f, 1.0f, 0.6f, 1.0f)
+            : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        ImGui::TextColored(col,
+            "[%3d] %-18s  par=%d  rot=(%.0f°,%.0f°,%.0f°)  "
+            "pos=(%.3f,%.3f,%.3f)",
+            i, b.name.c_str(), (int)b.parent_idx,
+            b.rot_x * (180.f / 3.14159f),
+            b.rot_y * (180.f / 3.14159f),
+            b.rot_z * (180.f / 3.14159f),
+            b.local_x, b.local_y, b.local_z);
+    }
+    if (bones.size() > 30)
+        ImGui::TextDisabled("... (%zu more bones)", bones.size() - 30);
+    ImGui::EndChild();
 }
 
 void ChunkInspector::RenderAnimationInfo() {

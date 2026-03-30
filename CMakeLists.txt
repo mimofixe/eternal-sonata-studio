@@ -63,6 +63,7 @@ add_executable(es_studio
     src/AIScriptViewer.cpp
     src/Tutorialparser.cpp
     src/Tutorialviewer.cpp
+    src/Nbn2parser.cpp
 )
 
 target_link_libraries(es_studio PRIVATE
