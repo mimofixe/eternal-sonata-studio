@@ -27,7 +27,7 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 - `.tex` file support
 - P3TEX texture archive browsing
 - Grid and detail viewing modes
-- Texture dimensions: 16×16 to 4096×4096
+- Texture dimensions: 16x16 to 4096x4096
 - PNG export with proper transparency (0xEE fill regions exported as alpha=0)
 - Works across `.e`, `.bop`, `.bmd`, and `.camp` files
 
@@ -43,17 +43,26 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 - Restart-aware tristrip decoding (`0xFFFF` primitive restart tokens handled correctly)
 - Correct geometry rendering for map meshes (strides 16/20/24/28) and character meshes (stride 32)
 - 10:10:10:2 packed normal decoding for static map geometry
-- OpenGL 4.5 rendering with wireframe/solid modes
-- Camera controls (orbit, pan, zoom) with auto-fit on load
+- Stride-48 particle meshes rendered as GL_POINTS (billboard particle systems)
+- OpenGL 4.5 rendering with camera controls (orbit, pan, zoom) and auto-fit on load
 - Vertex and triangle count statistics
+
+### NMDL Model Viewer (textured)
+
+- Select any NMDL chunk and click **Load Textured Model in Viewport** to load the full model
+- All meshes, materials and textures are loaded in one step from the NMDL envelope
+- Per-section draw calls: each face section binds the correct diffuse texture before drawing
+- Texture chain: `FaceSection.mat_id -> NMTR[mat_id].diffuse_img_id -> NTX3[img_id]`
+- Sections without a texture fall back to flat shaded colour
+- NMDL and single NSHP modes are mutually exclusive and share the same viewport
 
 ### Skeleton Viewing
 
 - NBN2 bone parser - confirmed layout from cross-referencing a 2015 Blender importer
 - Bind-pose world positions computed via BONESPACE algorithm (Euler XYZ, rotation encoding i16/4096)
-- Select any NBN2 chunk in the file browser → "Skeleton Info" tab → **Load Skeleton in Viewport**
+- Select any NBN2 chunk in the file browser -> "Skeleton Info" tab -> **Load Skeleton in Viewport**
 - Mesh and skeleton can be loaded simultaneously and toggled independently
-- Viewport rendering: yellow GL_LINES (parent→child, depth-tested) and white GL_POINTS (joints, always on top of mesh)
+- Viewport rendering: yellow GL_LINES (parent->child, depth-tested) and white GL_POINTS (joints, always on top of mesh)
 - Camera auto-fits to skeleton bounding box on load
 - "Flip Y" toggle for PS3 Y-down to OpenGL Y-up conversion
 - Bone list in ChunkInspector shows all bones inline with Euler angles, local positions, and type colour-coding (dynamic chains in blue, effectors in green)
@@ -70,9 +79,9 @@ Full analysis of the compiled AI scripts that drive enemy and boss behaviour in 
 
 **API catalog** - maps all 208 known `CALLAPI` addresses to named functions in two groups: special ability functions (one per boss/enemy) and per-enemy function vtables (`init`, `get_speed`, `get_range`, `seek_target`, `combat_state`, `special_seq`).
 
-**File tiers** - simple files (114 nodes, no debug strings) share a common combat template with one unique special ability each; complex files (370–600+ nodes) have a fully unique behaviour tree per enemy.
+**File tiers** - simple files (114 nodes, no debug strings) share a common combat template with one unique special ability each; complex files (370-600+ nodes) have a fully unique behaviour tree per enemy.
 
-Viewer tabs: **Overview · Disassembly · Actions · API Calls · Ctrl Flow · Strings** (complex only)
+Viewer tabs: **Overview - Disassembly - Actions - API Calls - Ctrl Flow - Strings** (complex only)
 
 ### Text Extraction
 
@@ -177,9 +186,14 @@ Texture data with DXT1 or DXT5 compression.
 - Stride 20: position + 10:10:10:2 packed normal + UV (i16/32767)
 - Stride 24: stride-20 layout + 4 extra bytes (lightmap UV or tangent, skipped)
 - Stride 28: stride-20 layout + 8 extra bytes (skipped)
-- Stride 32: skinned characters - position + bone weights (u8×4/255) + bone indices + unknown + UV (f16)
+- Stride 32: skinned characters - position + bone weights (u8x4/255) + bone indices + unknown + UV (f16)
+- Stride 48: particle / billboard positions, no index buffer, 12-byte footer
 
-All formats use restartable tristrips with `0xFFFF` as the primitive restart token.
+All indexed formats use restartable tristrips with `0xFFFF` as the primitive restart token.
+
+### NMDL Chunks
+
+Top-level model container. Contains all NSHP meshes, NTX3 textures and the NMTR material table for one model. Sub-chunks are found by byte-scanning within the NMDL size boundary.
 
 ### NBN2 Chunks
 
@@ -187,7 +201,7 @@ Skeleton bone table. Each entry is 64 bytes: name (16 bytes), flags (u16), paren
 
 ### NMTR Chunks
 
-Material definitions, 96 bytes per entry. `w[5]==1` at the first 8×u16 block indicates a diffuse texture; the NTX3 index is at `w[2]`. Alpha texture index is an i16 at `+0x30` (−1 = none).
+Material definitions, 96 bytes per entry. `w[5]==1` at the first 8xu16 block indicates a diffuse texture; the NTX3 index is at `w[2]`. Alpha texture index is an i16 at `+0x30` (-1 = none).
 
 ### CSF Chunks
 
@@ -212,6 +226,7 @@ eternal-sonata-studio/
 │   ├── EFileParser.h
 │   ├── NSHPParser.h
 │   ├── NBN2Parser.h
+│   ├── NMDLLoader.h
 │   ├── AIScriptParser.h
 │   └── ...
 ├── src/                # Source files
@@ -227,10 +242,10 @@ eternal-sonata-studio/
 ## Known Limitations
 
 - Animation data (NMTN) is parsed and listed but not yet visualised
-- Textured mesh rendering is not yet implemented (NMTR parsing is in place, draw calls not wired up)
+- Skinned mesh vertex normals are not yet decoded correctly; geometric normals are used as a workaround in the viewer
 - Xbox 360 specific compression not implemented
 - Material export not available
-- Problem with mipmap textures - fix pending
+- Problem with mipmap textures -- fix pending
 
 ---
 
@@ -246,11 +261,15 @@ BMD and CAMP files use two distinct header layouts depending on the file. The pa
 
 ### AI Script Parsing
 
-The AI VM uses a node-based execution model where each node returns one of four statuses (SUCCESS / FAILURE / RUNNING / BLOCKED). Instructions are variable-width, decoded with a 5-byte extended prefix (`0x81`) or standalone opcodes. The 23-word fixed header block after the `Dz` sentinel is identical across all 120 AI files - it is VM configuration, not per-file data.
+The AI VM uses a node-based execution model where each node returns one of four statuses (SUCCESS / FAILURE / RUNNING / BLOCKED). Instructions are variable-width, decoded with a 5-byte extended prefix (`0x81`) or standalone opcodes. The 23-word fixed header block after the `Dz` sentinel is identical across all 120 AI files -- it is VM configuration, not per-file data.
 
 ### Mesh Rendering
 
-NSHP meshes are parsed into vertex/index buffers and rendered using OpenGL 4.5 core profile. The tristrip decoder handles `0xFFFF` primitive restart tokens by ending the current strip and beginning a fresh one, resetting winding parity. Stride detection is automatic: the parser tries each candidate stride and validates that the vertex block ends where the face-section headers begin, with plausible strip counts and real vertex indices within range.
+NSHP meshes are parsed into vertex/index buffers and rendered using OpenGL 4.5 core profile. The tristrip decoder handles `0xFFFF` primitive restart tokens by ending the current strip and beginning a fresh one, resetting winding parity. Stride detection is automatic: the parser tries each candidate stride and validates that the vertex block ends where the face-section headers begin, with plausible strip counts and real vertex indices within range. The fragment shader computes geometric normals from screen-space derivatives rather than reading stored vertex normals, which avoids lighting artifacts caused by the PS3 normal coordinate convention.
+
+### NMDL Loading
+
+The NMDLLoader scans all sub-chunks within the NMDL size boundary, uploads each NTX3 texture to the GPU, parses the NMTR material table, and builds a `mat_id -> GLuint` map used at draw time. The scan uses 4-byte advances for unrecognised bytes rather than skipping by the size field, which avoids jumping past valid chunk data when encountering the NMDL internal header.
 
 ### Skeleton Rendering
 
@@ -268,7 +287,7 @@ CSF containers hold ATRAC3 audio data. The exporter strips the CSF framing and w
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License -- see LICENSE file for details.
 
 This project is for educational and preservation purposes. All game assets remain property of their respective copyright holders (Bandai Namco, tri-Crescendo).
 
