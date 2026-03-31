@@ -3,23 +3,21 @@
 #include <string>
 #include <cstdint>
 
-// Vertex
-// Unified struct for all vertex formats. Unused fields are zero.
+// vertex 
 
 struct Vertex {
     float   position[3] = {};
     float   normal[3] = {};   // decoded unit normal (zero when not available)
-    float   uv[2] = {};   // primary UV set
+    float   uv[2] = {};
 
     // Skinning (zero for static geometry)
     float   bone_weights[4] = {};
     uint8_t bone_ids[4] = {};   // local → remap via NSHPMesh::boneIDList
 };
 
-//FaceSection
+// FaceSection
 // One section = 8×u16 header (last u16 = raw tristrip index count).
 // The tristrip uses 0xFFFF restart tokens (NV_primitive_restart).
-// NSHPParser converts the restartable tristrip to a GL_TRIANGLES index list.
 
 struct FaceSection {
     uint16_t mat_id = 0;   // NMTR material index (first u16 of header)
@@ -27,99 +25,121 @@ struct FaceSection {
     uint16_t index_count = 0;   // number of indices (triangles×3)
 };
 
-//NSHPMesh
+// NSHPMesh
 
 struct NSHPMesh {
     std::string              name;
     std::vector<Vertex>      vertices;
-    std::vector<uint16_t>    indices;         // GL_TRIANGLES (restart-aware conversion)
-    std::vector<uint16_t>    boneIDList;      // local_bone_idx → NBN2 global index
+    std::vector<uint16_t>    indices;         // GL_TRIANGLES (restart-aware)
+    std::vector<uint16_t>    boneIDList;      // local → NBN2 global index
     std::vector<FaceSection> faceSections;
 
     uint16_t vertex_count = 0;
     uint16_t face_section_count = 0;
-    int      vertex_stride = 0;   // detected stride: 16/20/24/28 (static) or 32 (skinned)
+    int      vertex_stride = 0;
 
     // Skinning
-    bool  has_bones = false;
-    bool  has_skinning = false;  // alias of has_bones (API compat)
+    bool has_bones = false;
+    bool has_skinning = false;  // alias for API compat
 
-    // Backward-compatible single texture ref (from faceSections[0].mat_id)
-    bool     has_texture = false;
-    uint8_t  texture_id = 0;   // NMTR material index for first section
+    // When true: no index buffer present.
+    // Render with glDrawArrays(GL_TRIANGLES, 0, vertex_count) instead of glDrawElements.
+    // Occurs on stride=48 meshes with a 12-byte sequential footer.
+    bool draw_sequential = false;
+
+    // Texture ref derived from faceSections[0].mat_id after parsing
+    bool    has_texture = false;
+    uint8_t texture_id = 0;
 };
 
-//NMTR material entry (96 bytes each)
-// From EternalSonataPS3.py:
-//   w = g.H(8)              → +0x00: 8×u16
-//   if w[5]==1 → has_diffuse, diffuse_img_id = w[2]
-//   g.f(4); g.i(4); g.h(8); g.h(8); g.h(8)  → total = 16+16+16+16+16 = 80 bytes body
-//   entry total = 8×u16(16) + 80 = 96 bytes
+// NMTR material entry (96 bytes each)
 
 struct NMTREntry {
     bool    has_diffuse = false;
-    int16_t diffuse_img_id = -1;   // NTX3 index (-1 = none)
-    int16_t alpha_img_id = -1;   // NTX3 index (-1 = none)
+    int16_t diffuse_img_id = -1;
+    int16_t alpha_img_id = -1;
 };
 
-//NSHPParser
+// NSHPParser
 //
-// Vertex format summary (all static formats are for bone_count == 0):
+// Vertex formats (static bc==0):
 //
-//  SKINNED  (bone_count > 0)  stride = 32
-//    +0x00  f32×3  position XYZ
-//    +0x0C  u8×4   bone_weights (/ 255)
-//    +0x10  u8×4   bone_indices (local → boneIDList)
-//    +0x14  u8×8   unknown (normals candidate i8×3 at +0x14..+0x16)
-//    +0x1C  f16×2  UV
+//   stride 16  — position only (water/collision)
+//     +0x00  f32×3  position
+//     +0x0C  u8×4   unknown
 //
-//  STATIC stride 16 — position only
-//    +0x00  f32×3  position XYZ
-//    +0x0C  u8×4   unknown (always 00 20 08 00 in observed meshes)
+//   stride 20  — pos + packed normal + UV
+//     +0x00  f32×3  position
+//     +0x0C  u32    normal 10:10:10:2 snorm BE
+//     +0x10  i16×2  UV / 32767
 //
-//  STATIC stride 20 — pos + packed normal + UV
-//    +0x00  f32×3  position XYZ
-//    +0x0C  u32    normal 10:10:10:2 snorm BE
-//    +0x10  i16×2  UV / 32767
+//   stride 24  — pos + normal + UV + 4 extra
+//     +0x00  f32×3  position
+//     +0x0C  u32    normal 10:10:10:2 snorm BE
+//     +0x10  i16×2  UV / 32767
+//     +0x14  u8×4   unknown
 //
-//  STATIC stride 24 — pos + packed normal + UV + extra 4 bytes
-//    +0x00  f32×3  position XYZ
-//    +0x0C  u32    normal 10:10:10:2 snorm BE
-//    +0x10  i16×2  UV / 32767
-//    +0x14  u8×4   unknown (lightmap UV?)
+//   stride 28  — pos + normal + UV + 8 extra
+//     +0x00  f32×3  position
+//     +0x0C  u32    normal 10:10:10:2 snorm BE
+//     +0x10  i16×2  UV / 32767
+//     +0x14  u8×8   unknown
 //
-//  STATIC stride 28 — pos + packed normal + UV + extra 8 bytes
-//    +0x00  f32×3  position XYZ
-//    +0x0C  u32    normal 10:10:10:2 snorm BE
-//    +0x10  i16×2  UV / 32767
-//    +0x14  u8×8   unknown (tangent? lightmap?)
+//   stride 48  — sequential (no index buffer), 12-byte footer
+//     +0x00  f32×3  position
+//     +0x0C  u32    normal 10:10:10:2 snorm BE
+//     +0x10  i16×2  UV / 32767
+//     +0x14  u8×20  unknown
+//     draw_sequential = true; render with glDrawArrays
 //
-// All face sections use restartable tristrips (0xFFFF = strip restart).
+// Vertex format (skinned bc>0):
+//   stride 32  — pos + weights + ids + unknown + UV f16
+//     +0x00  f32×3  position
+//     +0x0C  u8×4   bone_weights (/255)
+//     +0x10  u8×4   bone_indices (local → boneIDList)
+//     +0x14  u8×8   unknown (i8×3 normals attempted)
+//     +0x1C  f16×2  UV
+//
+// Pre-vertex block:
+//   Some static meshes have a 32-byte block between the boneIDList and the
+//   vertex data. The first 4 bytes contain a small u32 count; the remaining
+//   28 bytes are zero. The parser detects this automatically.
+//
+// Face section padding:
+//   Chunks may end with up to 4 bytes of alignment padding after the last
+//   index. The size check allows leftover ≤ 4 bytes rather than requiring
+//   an exact match.
 
 class NSHPParser {
 public:
-    // Parse a full NSHP chunk. Tristrips (including 0xFFFF restarts) are
-    // converted to a GL_TRIANGLES index list in out.indices.
     static bool Parse(const uint8_t* data, size_t size, NSHPMesh& out);
-
-    // Parse an NMTR chunk into a flat list of material entries (96 bytes each).
-    // out[i] corresponds to material index i referenced by FaceSection::mat_id.
     static bool ParseNMTR(const uint8_t* data, size_t size,
         std::vector<NMTREntry>& out);
 
 private:
     static float    ReadF32BE(const uint8_t* d);
+    static uint32_t ReadU32BE(const uint8_t* d);
     static uint16_t ReadU16BE(const uint8_t* d);
     static int16_t  ReadI16BE(const uint8_t* d);
     static float    HalfToFloat(uint16_t h);
     static float    DecodeNormal10_10_10(uint32_t packed, int comp);
 
-    // Returns true if the given stride+offset produces a valid face-section
-    // header that fits in the chunk and has plausible index counts.
-    static bool TryStride(const uint8_t* data, size_t size,
-        size_t vstart, uint16_t vc, uint16_t fc, int stride);
+    // Try to parse vertex data starting at vstart with the given stride.
+    // Reads actual strip counts from face section headers, allows ≤4 bytes
+    // of trailing padding.  Returns true and fills out on success.
+    static bool TryStride(const uint8_t* data, size_t chunk_end,
+        size_t vstart, uint16_t vc, uint16_t fc,
+        int stride, NSHPMesh& out);
 
-    // Convert a restartable tristrip (0xFFFF = restart) to GL_TRIANGLES.
+    // Detect and handle the stride=48 sequential (no-index) mesh format.
+    // Returns true if the chunk matches the 12-byte footer pattern.
+    static bool TrySequential(const uint8_t* data, size_t chunk_end,
+        size_t vdata_start, uint16_t vc, NSHPMesh& out);
+
+    static void DecodeVertices(const uint8_t* data, size_t vstart,
+        uint16_t vc, int stride, bool skinned,
+        NSHPMesh& out);
+
     static void TristripToTriangles(const uint16_t* strip, size_t len,
         std::vector<uint16_t>& out);
 };

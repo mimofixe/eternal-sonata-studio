@@ -2,6 +2,7 @@
 #include "EFileParser.h"
 #include "NSHPParser.h"
 #include "NBN2Parser.h"
+#include "NMDLLoader.h"
 #include "Viewport3D.h"
 #include "P3TexParser.h"
 #include "TextureCache.h"
@@ -20,6 +21,7 @@ private:
     void RenderProperties();
     void RenderHexView();
     void RenderNSHPInfo();
+    void RenderNMDLInfo();
     void RenderCameraInfo();
     void RenderLightInfo();
     void RenderFogInfo();
@@ -42,6 +44,10 @@ private:
     Viewport3D* m_Viewport;
     P3TexParser* m_P3TexParser;
     TextureCache m_TextureCache;
+
+    // Pointer to the full file buffer — needed by NMDLLoader which scans
+    // the entire NMDL envelope, not just the isolated chunk data.
+    const std::vector<uint8_t>* m_FileData = nullptr;
 
     // Cache para evitar parsing repetido
     NSHPMesh m_CachedMesh;

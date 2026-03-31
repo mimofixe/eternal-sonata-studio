@@ -1,5 +1,6 @@
 ﻿#include "ChunkInspector.h"
 #include "NSHPParser.h"
+#include "NMDLLoader.h"
 #include <imgui.h>
 #include <cstring>
 #include <iostream>
@@ -40,6 +41,9 @@ void ChunkInspector::SetChunk(const Chunk& chunk, const std::vector<uint8_t>& fi
         m_ChunkData.insert(m_ChunkData.end(),
             file_data.begin() + chunk_start,
             file_data.begin() + chunk_end);
+
+        // Keep a reference to the full file data for NMDL loading
+        m_FileData = &file_data;
 
         memset(&m_CameraData, 0, sizeof(m_CameraData));
         memset(&m_LightData, 0, sizeof(m_LightData));
@@ -94,6 +98,11 @@ void ChunkInspector::Render() {
 
         if (m_CurrentChunk.type == ChunkType::NBN2 && ImGui::BeginTabItem("Skeleton Info")) {
             RenderNBN2Info();
+            ImGui::EndTabItem();
+        }
+
+        if (m_CurrentChunk.type == ChunkType::NMDL && ImGui::BeginTabItem("Model Info")) {
+            RenderNMDLInfo();
             ImGui::EndTabItem();
         }
 
@@ -260,7 +269,6 @@ void ChunkInspector::RenderNSHPInfo() {
                     ImGui::Text("Dimensions: %dx%d", tex->width, tex->height);
                     ImGui::Text("Data size: %zu bytes (%.2f KB)", tex->size, tex->size / 1024.0f);
 
-                    // MOSTRAR FORMATO CORRETO
                     if (tex->format == 0x86) {
                         ImGui::Text("Format: DXT1 compressed");
                     }
@@ -268,13 +276,11 @@ void ChunkInspector::RenderNSHPInfo() {
                         ImGui::Text("Format: DXT5 compressed");
                     }
 
-                    // BOTÃO PARA GERAR PREVIEW
                     ImGui::Separator();
 
                     static bool previewGenerated = false;
                     static uint8_t lastTextureId = 255;
 
-                    // Reset se mudou de textura
                     if (lastTextureId != m_CachedMesh.texture_id) {
                         previewGenerated = false;
                         lastTextureId = m_CachedMesh.texture_id;
@@ -284,7 +290,6 @@ void ChunkInspector::RenderNSHPInfo() {
                         if (ImGui::Button("Generate Preview", ImVec2(150, 0))) {
                             std::cout << "Decompressing texture " << (int)m_CachedMesh.texture_id << "..." << std::endl;
 
-                            // ESCOLHER DECOMPRESSOR BASEADO NO FORMATO
                             std::vector<uint8_t> rgba;
                             if (tex->format == 0x86) {
                                 std::cout << "  Format: DXT1" << std::endl;
@@ -295,7 +300,6 @@ void ChunkInspector::RenderNSHPInfo() {
                                 rgba = P3TexParser::DecompressDXT5(tex->data.data(), tex->width, tex->height);
                             }
 
-                            // Upload para GPU
                             m_TextureCache.GetOrCreateTexture(
                                 m_CachedMesh.texture_id, rgba.data(), tex->width, tex->height);
 
@@ -310,7 +314,6 @@ void ChunkInspector::RenderNSHPInfo() {
                         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "[OK] Preview ready");
                     }
 
-                    // MOSTRAR PREVIEW SE JÁ FOI GERADO
                     if (previewGenerated) {
                         GLuint gpuTexture = m_TextureCache.GetOrCreateTexture(
                             m_CachedMesh.texture_id, nullptr, 0, 0);
@@ -319,12 +322,10 @@ void ChunkInspector::RenderNSHPInfo() {
                             ImGui::Separator();
                             ImGui::Text("Texture Preview:");
 
-                            // Calcular tamanho do preview (max 256px)
                             float aspect = (float)tex->width / tex->height;
                             float preview_width = 256.0f;
                             float preview_height = preview_width / aspect;
 
-                            // Limitar altura também
                             if (preview_height > 256.0f) {
                                 preview_height = 256.0f;
                                 preview_width = preview_height * aspect;
@@ -334,7 +335,7 @@ void ChunkInspector::RenderNSHPInfo() {
                                 ImVec2(preview_width, preview_height),
                                 ImVec2(0, 0), ImVec2(1, 1),
                                 ImVec4(1, 1, 1, 1),
-                                ImVec4(0.3f, 0.3f, 0.3f, 1.0f)); // Border
+                                ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
 
                             ImGui::TextDisabled("(Actual size: %dx%d)", tex->width, tex->height);
                         }
@@ -380,6 +381,67 @@ void ChunkInspector::RenderNSHPInfo() {
     ImGui::TextDisabled("  - [Optional] Bone weights + IDs (skinned meshes)");
 }
 
+void ChunkInspector::RenderNMDLInfo() {
+    ImGui::Text("NMDL Model");
+    ImGui::Separator();
+
+    // Show basic header info
+    // NMDL w[2]=mat_count at chunk+0x22, w[4]=bone_count at chunk+0x26
+    if (m_ChunkData.size() >= 0x30) {
+        auto u16be = [](const uint8_t* d) { return uint16_t((d[0] << 8) | d[1]); };
+        const uint8_t* hdr = m_ChunkData.data();
+        uint16_t mat_count = u16be(hdr + 0x22);
+        uint16_t bone_count = u16be(hdr + 0x26);
+        ImGui::Text("Materials: %d", (int)mat_count);
+        ImGui::Text("Bones:     %d", (int)bone_count);
+        ImGui::Text("Size:      %.2f MB", m_CurrentChunk.size / (1024.0f * 1024.0f));
+    }
+
+    ImGui::Separator();
+
+    if (!m_Viewport) {
+        ImGui::TextDisabled("(no viewport connected)");
+        return;
+    }
+
+    if (ImGui::Button("Load Textured Model in Viewport", ImVec2(-1, 0))) {
+        if (m_FileData && !m_FileData->empty()) {
+            NMDLModel mdl;
+            bool ok = NMDLLoader::Load(
+                m_FileData->data(),
+                m_FileData->size(),
+                m_CurrentChunk.offset,
+                mdl);
+
+            if (ok) {
+                m_Viewport->LoadModel(mdl);
+                std::cout << "[ChunkInspector] NMDL model loaded into viewport\n";
+            }
+            else {
+                std::cerr << "[ChunkInspector] NMDLLoader::Load failed — check console\n";
+                ImGui::OpenPopup("NMDL Load Error");
+            }
+        }
+        else {
+            std::cerr << "[ChunkInspector] File data not available\n";
+        }
+    }
+
+    if (ImGui::BeginPopupModal("NMDL Load Error", nullptr,
+        ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Failed to load NMDL model.\nCheck the console for details.");
+        ImGui::Separator();
+        if (ImGui::Button("OK", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    if (m_Viewport->HasModel()) {
+        ImGui::Spacing();
+        if (ImGui::Button("Clear Model", ImVec2(-1, 0)))
+            m_Viewport->ClearModel();
+    }
+}
+
 void ChunkInspector::RenderNTX3Info() {
     ImGui::Text("NTX3 Texture Data");
     ImGui::Separator();
@@ -389,20 +451,15 @@ void ChunkInspector::RenderNTX3Info() {
         return;
     }
 
-    // Parse NTX3 header
     const uint8_t* header = m_ChunkData.data();
 
-    // Verify magic
     if (memcmp(header, "NTX3", 4) != 0) {
         ImGui::TextColored(ImVec4(1, 0, 0, 1), "Invalid NTX3 magic");
         return;
     }
 
-    // Read chunk size (big-endian)
     uint32_t chunk_size = (header[4] << 24) | (header[5] << 16) | (header[6] << 8) | header[7];
 
-
-    // Read dimensions as 16-bit big-endian
     uint16_t width = (header[0x20] << 8) | header[0x21];
     uint16_t height = (header[0x22] << 8) | header[0x23];
     uint8_t format_byte = header[0x18];
@@ -416,7 +473,6 @@ void ChunkInspector::RenderNTX3Info() {
     if (width > 0 && height > 0) {
         ImGui::Text("Dimensions: %dx%d", width, height);
 
-        // MOSTRAR FORMATO CORRETO
         if (format_byte == 0x86) {
             ImGui::Text("Format: DXT1 compressed");
         }
@@ -429,12 +485,10 @@ void ChunkInspector::RenderNTX3Info() {
 
         ImGui::Separator();
 
-        // Preview controls
         static bool previewGenerated = false;
         static size_t lastChunkOffset = 0;
         static GLuint cachedTexture = 0;
 
-        // Reset se mudou de chunk
         if (lastChunkOffset != m_CurrentChunk.offset) {
             previewGenerated = false;
             lastChunkOffset = m_CurrentChunk.offset;
@@ -448,11 +502,9 @@ void ChunkInspector::RenderNTX3Info() {
             if (ImGui::Button("Generate Preview", ImVec2(150, 0))) {
                 std::cout << "Decompressing NTX3 texture (" << width << "x" << height << ")..." << std::endl;
 
-                // Extract texture data (skip 128-byte NTX3 header)
                 std::vector<uint8_t> texture_data(data_size);
                 memcpy(texture_data.data(), m_ChunkData.data() + 128, data_size);
 
-                // ESCOLHER DECOMPRESSOR BASEADO NO FORMATO
                 std::vector<uint8_t> rgba;
                 if (format_byte == 0x86) {
                     std::cout << "  Format: DXT1" << std::endl;
@@ -463,17 +515,13 @@ void ChunkInspector::RenderNTX3Info() {
                     rgba = P3TexParser::DecompressDXT5(texture_data.data(), width, height);
                 }
 
-                // Upload to GPU
                 glGenTextures(1, &cachedTexture);
                 glBindTexture(GL_TEXTURE_2D, cachedTexture);
-
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
                 glBindTexture(GL_TEXTURE_2D, 0);
 
                 previewGenerated = true;
@@ -487,23 +535,19 @@ void ChunkInspector::RenderNTX3Info() {
             ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "[OK] Preview ready");
         }
 
-        // Show preview if generated
         if (previewGenerated && cachedTexture != 0) {
             ImGui::Separator();
             ImGui::Text("Texture Preview:");
 
-            // Calculate preview size (max 512px to see detail)
             float aspect = (float)width / height;
             float preview_width = 512.0f;
             float preview_height = preview_width / aspect;
 
-            // Limit height too
             if (preview_height > 512.0f) {
                 preview_height = 512.0f;
                 preview_width = preview_height * aspect;
             }
 
-            // Limit minimum size
             if (preview_width < 128.0f) {
                 preview_width = 128.0f;
                 preview_height = preview_width / aspect;
@@ -513,11 +557,10 @@ void ChunkInspector::RenderNTX3Info() {
                 ImVec2(preview_width, preview_height),
                 ImVec2(0, 0), ImVec2(1, 1),
                 ImVec4(1, 1, 1, 1),
-                ImVec4(0.3f, 0.3f, 0.3f, 1.0f)); // Border
+                ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
 
             ImGui::TextDisabled("(Actual size: %dx%d)", width, height);
 
-            // Export button
             ImGui::Separator();
             if (ImGui::Button("Export as DDS", ImVec2(120, 0))) {
                 ImGui::OpenPopup("Export DDS");
@@ -541,7 +584,6 @@ void ChunkInspector::RenderNTX3Info() {
         ImGui::Separator();
         ImGui::TextDisabled("Cannot generate preview without valid dimensions");
 
-        // Try to deduce dimensions
         int deduced_width = 0, deduced_height = 0;
         if (P3TexParser::DeduceDimensions(data_size, deduced_width, deduced_height)) {
             ImGui::Separator();
@@ -682,7 +724,6 @@ void ChunkInspector::RenderNBN2Info() {
         return;
     }
 
-    // Quick bone count estimate (each bone = 64 bytes, minus 8-byte chunk header)
     const int est_bones = (int)((m_ChunkData.size() - 8) / 64);
     ImGui::Text("Estimated bone count: %d", est_bones);
     ImGui::Spacing();
@@ -709,7 +750,6 @@ void ChunkInspector::RenderNBN2Info() {
         if (m_Viewport) m_Viewport->ClearSkeleton();
     }
 
-    // Show first 30 bones inline
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Text("Bone list (first 30):");
@@ -745,6 +785,7 @@ void ChunkInspector::RenderAnimationInfo() {
     ImGui::TextDisabled("Contains skeleton bones and keyframe transforms");
     ImGui::TextDisabled("Full parser not yet implemented");
 }
+
 void ChunkInspector::RenderTextView() {
     if (m_ChunkData.empty()) {
         ImGui::TextDisabled("No data");
@@ -767,11 +808,9 @@ void ChunkInspector::RenderTextView() {
         return;
     }
 
-    // Filtrar strings se dialog_only estiver ativo
     std::vector<std::string> filtered;
     if (dialog_only) {
         for (const auto& str : strings) {
-            // Ignorar strings técnicas
             if (str.find("NSHP") != std::string::npos ||
                 str.find("NTX3") != std::string::npos ||
                 str.find("NOBJ") != std::string::npos ||
@@ -784,7 +823,6 @@ void ChunkInspector::RenderTextView() {
                 continue;
             }
 
-            // Aceitar strings com espaços (frases) OU que terminam com <w> ou \n
             bool has_space = str.find(' ') != std::string::npos;
             bool is_dialog = str.find("<w>") != std::string::npos ||
                 str.find("\\n") != std::string::npos;
@@ -814,7 +852,6 @@ void ChunkInspector::RenderTextView() {
     for (size_t i = 0; i < filtered.size(); i++) {
         const std::string& str = filtered[i];
 
-        // Colorir baseado no tipo
         if (str.find("Polka") != std::string::npos ||
             str.find("Allegretto") != std::string::npos ||
             str.find("Beat") != std::string::npos ||
@@ -823,23 +860,18 @@ void ChunkInspector::RenderTextView() {
             str.find("Chopin") != std::string::npos ||
             str.find("Salsa") != std::string::npos ||
             str.find("March") != std::string::npos) {
-            // Nomes de personagens - Amarelo
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "[%zu] %s", i, str.c_str());
         }
         else if (str.find("<w>") != std::string::npos) {
-            // Diálogo - Verde
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "[%zu] %s", i, str.c_str());
         }
         else if (str.find("\\n") != std::string::npos) {
-            // Opções de menu - Ciano
             ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "[%zu] %s", i, str.c_str());
         }
         else if (str.find("?") != std::string::npos || str.find("!") != std::string::npos) {
-            // Perguntas/exclamações - Branco brilhante
             ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "[%zu] %s", i, str.c_str());
         }
         else {
-            // Resto - Cinzento
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "[%zu] %s", i, str.c_str());
         }
     }
@@ -854,26 +886,22 @@ std::vector<std::string> ChunkInspector::ExtractStrings(const uint8_t* data, siz
     for (size_t i = 0; i < size; i++) {
         uint8_t byte = data[i];
 
-        // Caracteres ASCII imprimíveis + alguns especiais do jogo
         if ((byte >= 32 && byte <= 126) || byte == '\n' || byte == '\r' || byte == '\t') {
             current += (char)byte;
         }
         else {
             if (current.length() >= min_length) {
-                // Limpar espaços no início e fim
                 size_t start = current.find_first_not_of(" \t\n\r");
                 size_t end = current.find_last_not_of(" \t\n\r");
 
                 if (start != std::string::npos) {
                     std::string trimmed = current.substr(start, end - start + 1);
 
-                    // Verificar se tem pelo menos alguns caracteres alfabéticos
                     int alpha_count = 0;
                     for (char c : trimmed) {
                         if (isalpha(c)) alpha_count++;
                     }
 
-                    // Aceitar se tem pelo menos 40% de letras
                     if (!trimmed.empty() && alpha_count > (int)(trimmed.length() * 0.4)) {
                         strings.push_back(trimmed);
                     }
@@ -883,7 +911,6 @@ std::vector<std::string> ChunkInspector::ExtractStrings(const uint8_t* data, siz
         }
     }
 
-    // Última string
     if (current.length() >= min_length) {
         size_t start = current.find_first_not_of(" \t\n\r");
         size_t end = current.find_last_not_of(" \t\n\r");
