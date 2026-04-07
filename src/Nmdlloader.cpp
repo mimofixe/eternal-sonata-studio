@@ -35,8 +35,16 @@ GLuint NMDLLoader::UploadNTX3(const uint8_t* data, size_t size, bool& is_dxt5_ou
         for (size_t bx = 0; bx < blocks_x; bx++) {
             const uint8_t* block = compressed + (by * blocks_x + bx) * block_bytes;
             uint8_t* dest = rgba.data() + (by * 4 * w + bx * 4) * 4;
-            if (is_bc1) bcdec_bc1(block, dest, row_pitch);
-            else        bcdec_bc3(block, dest, row_pitch);
+            if (is_bc1) {
+                bcdec_bc1(block, dest, row_pitch);
+            }
+            else {
+                // PS3 Namco DXT5: colour block first (0-7), alpha second (8-15).
+                uint8_t swapped[16];
+                std::memcpy(swapped, block + 8, 8);
+                std::memcpy(swapped + 8, block, 8);
+                bcdec_bc3(swapped, dest, row_pitch);
+            }
         }
 
     GLuint tex = 0;

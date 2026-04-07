@@ -206,8 +206,7 @@ bool NTX3Parser::DecompressDXT1(const uint8_t* src, uint16_t width,
 
 // DecompressDXT5 (BC3)
 bool NTX3Parser::DecompressDXT5(const uint8_t* src, uint16_t width,
-    uint16_t height, std::vector<uint8_t>& rgba,
-    bool ps3_swap) {
+    uint16_t height, std::vector<uint8_t>& rgba) {
     int bx_count = (width + 3) / 4;
     int by_count = (height + 3) / 4;
 
@@ -215,16 +214,13 @@ bool NTX3Parser::DecompressDXT5(const uint8_t* src, uint16_t width,
         for (int bx = 0; bx < bx_count; bx++) {
             // 0xEE fill check (DXT5 block = 16 bytes)
             if (!IsEEFillBlock(src)) {
+                // PS3 Namco DXT5: colour block first (0-7), alpha block second (8-15).
+                // bcdec_bc3 expects alpha first — swap the two 8-byte halves.
+                uint8_t swapped[16];
+                std::memcpy(swapped, src + 8, 8);
+                std::memcpy(swapped + 8, src, 8);
                 uint8_t block_rgba[64];
-                if (ps3_swap) {
-                    uint8_t swapped[16];
-                    std::memcpy(swapped, src + 8, 8);
-                    std::memcpy(swapped + 8, src, 8);
-                    bcdec_bc3(swapped, block_rgba, 16);
-                }
-                else {
-                    bcdec_bc3(src, block_rgba, 16);
-                }
+                bcdec_bc3(swapped, block_rgba, 16);
 
                 for (int py = 0; py < 4 && (by * 4 + py) < height; py++) {
                     for (int px = 0; px < 4 && (bx * 4 + px) < width; px++) {

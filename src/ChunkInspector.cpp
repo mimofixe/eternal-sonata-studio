@@ -646,13 +646,10 @@ void ChunkInspector::RenderNTX3Info() {
                     std::memcpy(rgba.data(), dxt_data, rgba.size());
                 }
                 else {
-                    // .bmd files start with 'BMD ' — they store DXT5 with swapped halves.
-                    const bool is_bmd = (m_FileData && m_FileData->size() >= 4 &&
-                        (*m_FileData)[0] == 'B' && (*m_FileData)[1] == 'M' &&
-                        (*m_FileData)[2] == 'D' && (*m_FileData)[3] == ' ');
-                    std::cout << "  Format: DXT5 (bmd=" << is_bmd << ")" << std::endl;
+                    // All PS3 Namco DXT5 use swapped block layout (colour first, alpha second).
+                    std::cout << "  Format: DXT5" << std::endl;
                     rgba.resize(size_t(width) * height * 4, 0);
-                    NTX3Parser::DecompressDXT5(dxt_data, width, height, rgba, is_bmd);
+                    NTX3Parser::DecompressDXT5(dxt_data, width, height, rgba);
                 }
 
                 glGenTextures(1, &cachedTexture);

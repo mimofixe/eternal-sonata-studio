@@ -61,9 +61,9 @@ void EFileTextureViewer::ExtractTextures(const std::vector<Chunk>& chunks, const
         uint16_t height = (header[0x22] << 8) | header[0x23];
         uint8_t format = header[0x18];
 
-        // Extract texture data (skip 128-byte header)
-        size_t data_start = chunk_start + 128;
-        size_t data_size = chunk.size - 128;
+        // NTX3 pixel data starts at +0x88 (136-byte header, not 128).
+        size_t data_start = chunk_start + 0x88;
+        size_t data_size = chunk.size - 0x88;
 
         if (data_start + data_size > file_data.size()) {
             continue;

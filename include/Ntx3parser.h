@@ -63,8 +63,7 @@ public:
     static bool DecompressDXT1(const uint8_t* src, uint16_t width,
         uint16_t height, std::vector<uint8_t>& rgba);
     static bool DecompressDXT5(const uint8_t* src, uint16_t width,
-        uint16_t height, std::vector<uint8_t>& rgba,
-        bool ps3_swap = false);
+        uint16_t height, std::vector<uint8_t>& rgba);
 
 private:
     static uint16_t ReadU16BE(const uint8_t* data);
