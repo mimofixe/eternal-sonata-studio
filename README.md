@@ -23,10 +23,10 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 
 ### Texture Viewing
 
-- NTX3 texture format support (DXT1/DXT5 compression)
+- NTX3 texture format support (DXT1/DXT5/DXT1+mip/DXT5+mip/RGBA8 compression)
+- Full PS3 DXT5 block-swap decoding (Namco stores colour and alpha sub-blocks in reverse order)
 - `.tex` file support
-- P3TEX texture archive browsing
-- Grid and detail viewing modes
+- P3TEX texture archive browsing with grid and detail viewing modes
 - Texture dimensions: 16x16 to 4096x4096
 - PNG export with proper transparency (0xEE fill regions exported as alpha=0)
 - Works across `.e`, `.bop`, `.bmd`, and `.camp` files
@@ -55,6 +55,12 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 - Texture chain: `FaceSection.mat_id -> NMTR[mat_id].diffuse_img_id -> NTX3[img_id]`
 - Sections without a texture fall back to flat shaded colour
 - NMDL and single NSHP modes are mutually exclusive and share the same viewport
+
+**Map texture support** -- map NMDL chunks reference an external `.p3tex` archive rather than embedding NTX3 textures directly. A **Load .p3tex for this map** button in the Model Info tab loads the archive and uploads all textures. The material-to-texture chain resolves identically to the embedded path.
+
+**DXT5 blend pass** -- materials with DXT5 diffuse textures (full 8-bit alpha) are drawn in a second render pass with `GL_BLEND` enabled and depth writes suppressed. Transparent sprites, leaf overlays, and ground decals composite correctly over opaque geometry.
+
+**Terrain UV** -- stride-24 map meshes use a two-field UV: `UV = i16/32767 + f16`. The f16 field alone collapses to zero after `GL_REPEAT` for integer offset values. The i16 component provides the fractional base for correct texture coverage. Sprite/prop meshes on the same stride use f16 only, detected per-vertex by `|f16| > 1.0`.
 
 ### Skeleton Viewing
 
@@ -171,12 +177,16 @@ Higher-level container with a section table. Supported layouts:
 
 ### NTX3 Chunks
 
-Texture data with DXT1 or DXT5 compression.
+Texture data. The format byte at offset `0x18` determines the compression type. Bit `0x20` indicates a mipmap chain and is masked off before comparing: `(fmt & 0xDF) == 0x86` -> DXT1, `(fmt & 0xDF) == 0x88` -> DXT5, `fmt == 0xA5` -> raw RGBA8.
 
-- Header: 128 bytes
-- Dimensions: 16-bit big-endian at offsets `0x20` and `0x22`
-- Format byte at offset `0x18` (`0x86` = DXT1, other = DXT5)
-- Compressed data follows header
+- Header: 136 bytes (`0x88`). Pixel data starts at `+0x88`.
+- Dimensions: 16-bit big-endian at offsets `0x20` (width) and `0x22` (height)
+- DXT5: colour sub-block first (bytes 0-7), alpha sub-block second (bytes 8-15) -- halves are swapped before calling `bcdec_bc3`
+- RGBA8 (0xA5): header height is `actual_height / 2`; real height = `data_size / (width x 4)`
+
+### P3TEX Files
+
+Archive containing multiple NTX3 textures. Pixel data for each chunk starts at `chunk_offset + 0x88`. DXT5 textures use the PS3 block-swap.
 
 ### NSHP Chunks
 
@@ -184,7 +194,7 @@ Texture data with DXT1 or DXT5 compression.
 
 - Stride 16: position only (water, collision geometry)
 - Stride 20: position + 10:10:10:2 packed normal + UV (i16/32767)
-- Stride 24: stride-20 layout + 4 extra bytes (lightmap UV or tangent, skipped)
+- Stride 24: position + normal + two-field UV (`i16/32767 + f16` for tiling terrain; `f16` only for sprites, detected per-vertex by `|f16| > 1.0`)
 - Stride 28: stride-20 layout + 8 extra bytes (skipped)
 - Stride 32: skinned characters - position + bone weights (u8x4/255) + bone indices + unknown + UV (f16)
 - Stride 48: particle / billboard positions, no index buffer, 12-byte footer
@@ -193,7 +203,7 @@ All indexed formats use restartable tristrips with `0xFFFF` as the primitive res
 
 ### NMDL Chunks
 
-Top-level model container. Contains all NSHP meshes, NTX3 textures and the NMTR material table for one model. Sub-chunks are found by byte-scanning within the NMDL size boundary.
+Top-level model container. Contains all NSHP meshes, NTX3 textures and the NMTR material table for one model. Map models carry no embedded NTX3; textures come from a companion `.p3tex` archive loaded separately. Sub-chunks are found by byte-scanning within the NMDL size boundary.
 
 ### NBN2 Chunks
 
@@ -206,10 +216,6 @@ Material definitions, 96 bytes per entry. `w[5]==1` at the first 8xu16 block ind
 ### CSF Chunks
 
 Audio container holding ATRAC3 streams. Exportable to `.at3`. Loads from file or directly from a memory buffer inside any container format.
-
-### P3TEX Files
-
-Archive containing multiple NTX3 textures with an index of texture offsets.
 
 ### P3OBJ Files
 
@@ -245,7 +251,6 @@ eternal-sonata-studio/
 - Skinned mesh vertex normals are not yet decoded correctly; geometric normals are used as a workaround in the viewer
 - Xbox 360 specific compression not implemented
 - Material export not available
-- Problem with mipmap textures -- fix pending
 
 ---
 
@@ -253,11 +258,11 @@ eternal-sonata-studio/
 
 ### Texture Decompression
 
-DXT1 and DXT5 textures are decompressed on-the-fly using the bcdec library. Decompressed RGBA data is cached in GPU memory for performance. PNG exports apply transparency to fill regions (0xEE-padded blocks) so exported files are clean.
+DXT1 and DXT5 textures are decompressed on-the-fly using the bcdec library. All format detection uses `(fmt & 0xDF)` to strip the Cell GCM mipmap flag (`0x20`) before identifying the base format. DXT5 blocks in PS3 Namco files have their colour and alpha sub-blocks stored in the reverse of the PC convention; the two 8-byte halves are swapped before calling `bcdec_bc3`. RGBA8 (format `0xA5`) is copied directly; the NTX3 header stores half the real pixel height and is corrected from the data size. Decompressed RGBA data is cached in GPU memory.
 
 ### Container Parsing
 
-BMD and CAMP files use two distinct header layouts depending on the file. The parser auto-detects which layout is in use based on the value at offset `0x0C`. NOBJ sub-containers are parsed with the same byte-scan approach as `.e` files, finding all chunks at any nesting depth.
+BMD and CAMP files use two distinct header layouts depending on the file. The parser auto-detects which layout is in use based on the value at offset `0x0C`. NOBJ sub-containers are parsed with the same byte-scan approach as `.e` files, finding all chunks at any nesting depth. BMD files are identified at runtime by their `BMD ` magic header to select the correct DXT5 decoding path for inline NTX3 previews.
 
 ### AI Script Parsing
 
@@ -265,11 +270,11 @@ The AI VM uses a node-based execution model where each node returns one of four 
 
 ### Mesh Rendering
 
-NSHP meshes are parsed into vertex/index buffers and rendered using OpenGL 4.5 core profile. The tristrip decoder handles `0xFFFF` primitive restart tokens by ending the current strip and beginning a fresh one, resetting winding parity. Stride detection is automatic: the parser tries each candidate stride and validates that the vertex block ends where the face-section headers begin, with plausible strip counts and real vertex indices within range. The fragment shader computes geometric normals from screen-space derivatives rather than reading stored vertex normals, which avoids lighting artifacts caused by the PS3 normal coordinate convention.
+NSHP meshes are parsed into vertex/index buffers and rendered using OpenGL 4.5 core profile. The tristrip decoder handles `0xFFFF` primitive restart tokens by ending the current strip and beginning a fresh one, resetting winding parity. Stride detection is automatic: the parser tries each candidate stride and validates that the vertex block ends where the face-section headers begin, with plausible strip counts and real vertex indices within range.
 
 ### NMDL Loading
 
-The NMDLLoader scans all sub-chunks within the NMDL size boundary, uploads each NTX3 texture to the GPU, parses the NMTR material table, and builds a `mat_id -> GLuint` map used at draw time. The scan uses 4-byte advances for unrecognised bytes rather than skipping by the size field, which avoids jumping past valid chunk data when encountering the NMDL internal header.
+The NMDLLoader scans all sub-chunks within the NMDL size boundary, uploads each NTX3 texture to the GPU via bcdec, and builds a `mat_id -> GLuint` map used at draw time. For map models, textures come from a separately loaded `.p3tex` archive; the material chain resolves identically. Materials with DXT5 diffuse textures are placed in `mat_blend_ids` and drawn in a second pass with `GL_BLEND` and depth-write suppressed.
 
 ### Skeleton Rendering
 
