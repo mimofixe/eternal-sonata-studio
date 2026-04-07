@@ -3,26 +3,30 @@
 #include "../libs/bcdec/bcdec.h"
 
 // ---------------------------------------------------------------------------
-// NTX3 header layout (confirmed by binary analysis of 17 files):
+// NTX3 header layout (confirmed by binary analysis):
 //
 //   0x00-0x03  "NTX3" magic
 //   0x04-0x07  chunk total size (BE u32)
 //   0x08-0x17  version/flags (unused)
-//   0x18       format byte: 0x86=DXT1, 0xA5=unknown/skip, else=DXT5
+//   0x18       format byte: 0x86=DXT1, 0xA5=unsupported raw, else=DXT5
 //   0x19       mip count
-//   0x1A       always 0x02 (irrelevant)
+//   0x1A       always 0x02
 //   0x20-0x21  width  (BE u16)
 //   0x22-0x23  height (BE u16)
-//   0x58-0x7F  PS3 RSX padding (always 0x50)
-//   0x80+      pixel data — base mip first, smaller mips after
+//   0x58-0x7F  PS3 RSX padding (0x50 bytes)
+//   0x80-0x87  8-byte NTX3 sub-header (size/flags, NOT pixel data)
+//   0x88+      pixel data — base mip first, smaller mips after
 //
-// Pixel data ALWAYS starts at chunk_offset + 128 (0x80).
-// This is identical for .e files, .bmd files, and .bop files.
+// Pixel data ALWAYS starts at chunk_offset + 0x88 (136 bytes), NOT +0x80.
+// The 8 bytes at 0x80..0x87 are a sub-header, not DXT blocks.
+// P3TexParser already uses 0x88 — this file must match.
 // ---------------------------------------------------------------------------
+
+static constexpr size_t NTX3_HEADER_SIZE = 0x88;  // 136 bytes
 
 bool NTX3Parser::ParseHeader(const uint8_t* file_data, size_t chunk_offset,
     size_t file_size, NTX3TextureInfo& out_info) {
-    if (chunk_offset + 128 > file_size) {
+    if (chunk_offset + NTX3_HEADER_SIZE > file_size) {
         return false;
     }
 
@@ -33,7 +37,7 @@ bool NTX3Parser::ParseHeader(const uint8_t* file_data, size_t chunk_offset,
     }
 
     uint32_t chunk_size = ReadU32BE(h + 4);
-    if (chunk_size < 128 || chunk_offset + chunk_size > file_size) {
+    if (chunk_size < NTX3_HEADER_SIZE || chunk_offset + chunk_size > file_size) {
         return false;
     }
 
@@ -49,7 +53,7 @@ bool NTX3Parser::ParseHeader(const uint8_t* file_data, size_t chunk_offset,
         return false;
     }
 
-    if (b18 == 0x86) {
+    if ((b18 & 0xDF) == 0x86) {
         out_info.format = NTX3Format::DXT1;
     }
     else if (b18 == 0xA5) {
@@ -60,14 +64,15 @@ bool NTX3Parser::ParseHeader(const uint8_t* file_data, size_t chunk_offset,
         out_info.format = NTX3Format::DXT5;
     }
 
-    out_info.pixel_data_offset = chunk_offset + 128;
-    out_info.pixel_data_size = chunk_size - 128;
+    // Pixel data starts at +0x88, not +0x80.
+    // Bytes 0x80..0x87 are a NTX3 sub-header, NOT part of the DXT stream.
+    out_info.pixel_data_offset = chunk_offset + NTX3_HEADER_SIZE;
+    out_info.pixel_data_size = chunk_size - NTX3_HEADER_SIZE;
 
     return true;
 }
 
-// DecompressToRGBA
-// Decompresses only the BASE mip (first in the data stream).
+// DecompressToRGBA — decompresses only the base mip (first in the data stream).
 // Blocks that are entirely 0xEE are made transparent so fill areas show as
 // alpha=0 in the viewer instead of the golden-yellow colour.
 
@@ -110,16 +115,19 @@ bool NTX3Parser::CreateGLTexture(const uint8_t* file_data,
         info.width, info.height, 0,
         GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+    glBindTexture(GL_TEXTURE_2D, 0);
+
     return true;
 }
 
 // LoadTexture — convenience wrapper
-
 bool NTX3Parser::LoadTexture(const uint8_t* file_data, size_t chunk_offset,
     size_t file_size, GLuint& out_texture,
     uint16_t* out_width, uint16_t* out_height) {
@@ -139,7 +147,6 @@ bool NTX3Parser::LoadTexture(const uint8_t* file_data, size_t chunk_offset,
 }
 
 // IsEEFillBlock
-
 bool NTX3Parser::IsEEFillBlock(const uint8_t* block) {
     for (int i = 0; i < 16; i++) {
         if (block[i] != 0xEE) return false;
@@ -148,7 +155,6 @@ bool NTX3Parser::IsEEFillBlock(const uint8_t* block) {
 }
 
 // Helpers
-
 uint16_t NTX3Parser::ReadU16BE(const uint8_t* data) {
     return static_cast<uint16_t>((data[0] << 8) | data[1]);
 }
@@ -161,7 +167,6 @@ uint32_t NTX3Parser::ReadU32BE(const uint8_t* data) {
 }
 
 // DecompressDXT1 (BC1)
-
 bool NTX3Parser::DecompressDXT1(const uint8_t* src, uint16_t width,
     uint16_t height, std::vector<uint8_t>& rgba) {
     int bx_count = (width + 3) / 4;
@@ -181,9 +186,7 @@ bool NTX3Parser::DecompressDXT1(const uint8_t* src, uint16_t width,
 
                 for (int py = 0; py < 4 && (by * 4 + py) < height; py++) {
                     for (int px = 0; px < 4 && (bx * 4 + px) < width; px++) {
-                        int dst_x = bx * 4 + px;
-                        int dst_y = by * 4 + py;
-                        int dst = (dst_y * width + dst_x) * 4;
+                        int dst = ((by * 4 + py) * width + (bx * 4 + px)) * 4;
                         int s = (py * 4 + px) * 4;
                         rgba[dst + 0] = block_rgba[s + 0];
                         rgba[dst + 1] = block_rgba[s + 1];
@@ -202,9 +205,9 @@ bool NTX3Parser::DecompressDXT1(const uint8_t* src, uint16_t width,
 }
 
 // DecompressDXT5 (BC3)
-
 bool NTX3Parser::DecompressDXT5(const uint8_t* src, uint16_t width,
-    uint16_t height, std::vector<uint8_t>& rgba) {
+    uint16_t height, std::vector<uint8_t>& rgba,
+    bool ps3_swap) {
     int bx_count = (width + 3) / 4;
     int by_count = (height + 3) / 4;
 
@@ -213,13 +216,19 @@ bool NTX3Parser::DecompressDXT5(const uint8_t* src, uint16_t width,
             // 0xEE fill check (DXT5 block = 16 bytes)
             if (!IsEEFillBlock(src)) {
                 uint8_t block_rgba[64];
-                bcdec_bc3(src, block_rgba, 16);
+                if (ps3_swap) {
+                    uint8_t swapped[16];
+                    std::memcpy(swapped, src + 8, 8);
+                    std::memcpy(swapped + 8, src, 8);
+                    bcdec_bc3(swapped, block_rgba, 16);
+                }
+                else {
+                    bcdec_bc3(src, block_rgba, 16);
+                }
 
                 for (int py = 0; py < 4 && (by * 4 + py) < height; py++) {
                     for (int px = 0; px < 4 && (bx * 4 + px) < width; px++) {
-                        int dst_x = bx * 4 + px;
-                        int dst_y = by * 4 + py;
-                        int dst = (dst_y * width + dst_x) * 4;
+                        int dst = ((by * 4 + py) * width + (bx * 4 + px)) * 4;
                         int s = (py * 4 + px) * 4;
                         rgba[dst + 0] = block_rgba[s + 0];
                         rgba[dst + 1] = block_rgba[s + 1];

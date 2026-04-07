@@ -1,5 +1,6 @@
 #include "EFileTextureViewer.h"
 #include "P3TexParser.h"
+#include "Ntx3parser.h"
 #include "FileDialog.h"
 #include <imgui.h>
 #include <iostream>
@@ -243,7 +244,7 @@ void EFileTextureViewer::RenderDetail() {
     ImGui::Separator();
 
     ImGui::Text("Dimensions: %dx%d", tex.width, tex.height);
-    ImGui::Text("Format: %s", tex.format == 0x86 ? "DXT1" : "DXT5");
+    ImGui::Text("Format: %s", (tex.format & 0xDF) == 0x86 ? "DXT1" : "DXT5");
     ImGui::Text("Data Size: %zu bytes", tex.data.size());
     ImGui::Text("Offset: 0x%zX", tex.offset);
 
@@ -321,11 +322,12 @@ void EFileTextureViewer::GeneratePreview(size_t textureIdx) {
     }
 
     std::vector<uint8_t> rgba;
-    if (tex.format == 0x86) {
+    if ((tex.format & 0xDF) == 0x86) {
         rgba = P3TexParser::DecompressDXT1(tex.data.data(), tex.width, tex.height);
     }
     else {
-        rgba = P3TexParser::DecompressDXT5(tex.data.data(), tex.width, tex.height);
+        rgba.resize(size_t(tex.width) * tex.height * 4, 0);
+        NTX3Parser::DecompressDXT5(tex.data.data(), tex.width, tex.height, rgba);
     }
 
     m_TextureCache.GetOrCreateTexture(tex.id, rgba.data(), tex.width, tex.height);
@@ -373,11 +375,12 @@ void EFileTextureViewer::ExportTexturePNG(size_t textureIdx) {
 
     // Decompress texture
     std::vector<uint8_t> rgba;
-    if (tex.format == 0x86) {
+    if ((tex.format & 0xDF) == 0x86) {
         rgba = P3TexParser::DecompressDXT1(tex.data.data(), tex.width, tex.height);
     }
     else {
-        rgba = P3TexParser::DecompressDXT5(tex.data.data(), tex.width, tex.height);
+        rgba.resize(size_t(tex.width) * tex.height * 4, 0);
+        NTX3Parser::DecompressDXT5(tex.data.data(), tex.width, tex.height, rgba);
     }
 
     // For PNG export: make 0xEE fill blocks transparent (alpha=0).
@@ -386,7 +389,7 @@ void EFileTextureViewer::ExportTexturePNG(size_t textureIdx) {
     // ever produces that pattern. The viewer keeps them visible (golden-yellow)
     // so you can see the raw texture data; the exported file gets clean alpha.
     if (!rgba.empty()) {
-        int block_size = (tex.format == 0x86) ? 8 : 16;
+        int block_size = ((tex.format & 0xDF) == 0x86) ? 8 : 16;
         int bx_count = tex.width / 4;
         int by_count = tex.height / 4;
 

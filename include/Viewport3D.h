@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <cfloat>
 #include "NSHPParser.h"
 #include "NMDLLoader.h"
@@ -62,6 +63,9 @@ private:
     // NMDL model
     std::vector<MeshGPUData>             m_ModelMeshes;
     std::unordered_map<uint16_t, GLuint> m_MatToTex;
+    std::unordered_map<uint16_t, GLuint> m_MatToAlpha;
+    std::unordered_set<uint16_t>          m_MatClampIds;
+    std::unordered_set<uint16_t>          m_MatBlendIds;
     std::vector<GLuint>                  m_ModelTextures;
     bool m_HasModel = false;
 

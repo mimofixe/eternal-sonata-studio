@@ -57,9 +57,15 @@ bool P3TexParser::Load(const std::string& filename) {
         uint16_t height = (buffer[pos + 0x22] << 8) | buffer[pos + 0x23];
         uint8_t format_byte = buffer[pos + 0x18];
 
+        // 0xA5 = raw RGBA8 uncompressed. Header stores h/2; actual height from data.
+        if (format_byte == 0xA5 && width > 0 && chunk_size > 0x88) {
+            height = static_cast<uint16_t>((chunk_size - 0x88) / (width * 4));
+        }
+
+
         P3Texture texture;
-        texture.offset = pos + 128;
-        texture.size = chunk_size - 128;
+        texture.offset = pos + 0x88;  // NTX3 header = 136 bytes (0x88), not 128
+        texture.size = chunk_size - 0x88;
         texture.format = format_byte;
 
         if (texture.offset + texture.size <= file_size) {
@@ -87,7 +93,7 @@ bool P3TexParser::Load(const std::string& filename) {
                     << ": " << width << "x" << height;
             }
 
-            if (format_byte == 0x86) {
+            if ((format_byte & 0xDF) == 0x86) {
                 std::cout << " [DXT1]";
             }
             else {
@@ -226,8 +232,17 @@ std::vector<uint8_t> P3TexParser::DecompressDXT5(const uint8_t* data, int width,
         for (int bx = 0; bx < blockCountX; bx++) {
             const uint8_t* blockData = dxt5Data + (by * blockCountX + bx) * 16;
 
+            // PS3 Namco DXT5 stores the block halves in reverse order:
+            //   bytes  0-7: color block  (c0, c1, color indices)
+            //   bytes 8-15: alpha block  (a0, a1, alpha indices)
+            // Standard bcdec_bc3 expects alpha first, color second.
+            // Swap the two 8-byte halves before decoding.
+            uint8_t swapped[16];
+            std::memcpy(swapped, blockData + 8, 8);  // color → front (alpha slot)
+            std::memcpy(swapped + 8, blockData, 8);  // alpha → back  (color slot)
+
             uint8_t blockRGBA[64];
-            bcdec_bc3(blockData, blockRGBA, 16);
+            bcdec_bc3(swapped, blockRGBA, 16);
 
             for (int py = 0; py < 4; py++) {
                 for (int px = 0; px < 4; px++) {
@@ -248,5 +263,10 @@ std::vector<uint8_t> P3TexParser::DecompressDXT5(const uint8_t* data, int width,
         }
     }
 
+    return rgba;
+}
+std::vector<uint8_t> P3TexParser::DecompressRGBA8(const uint8_t* data, int width, int height) {
+    std::vector<uint8_t> rgba(size_t(width) * height * 4, 0);
+    std::memcpy(rgba.data(), data, rgba.size());
     return rgba;
 }

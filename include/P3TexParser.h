@@ -10,7 +10,7 @@ struct P3Texture {
 
     int width;
     int height;
-    uint8_t format; 
+    uint8_t format;
 
     P3Texture() : offset(0), size(0), width(0), height(0), format(0) {}
 };
@@ -32,6 +32,8 @@ public:
     static bool DeduceDimensions(size_t dataSize, int& width, int& height);
     static std::vector<uint8_t> DecompressDXT1(const uint8_t* data, int width, int height);  // NOVO
     static std::vector<uint8_t> DecompressDXT5(const uint8_t* data, int width, int height);
+    // Raw RGBA8 uncompressed (format 0xA5)
+    static std::vector<uint8_t> DecompressRGBA8(const uint8_t* data, int width, int height);
 
 private:
     std::vector<P3Texture> m_Textures;

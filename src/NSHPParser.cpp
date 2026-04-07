@@ -4,8 +4,6 @@
 #include <iostream>
 #include <algorithm>
 
-// Binary helpers
-
 float NSHPParser::ReadF32BE(const uint8_t* d) {
     uint32_t u = (uint32_t(d[0]) << 24) | (uint32_t(d[1]) << 16) | (uint32_t(d[2]) << 8) | d[3];
     float f; std::memcpy(&f, &u, 4); return f;
@@ -33,13 +31,10 @@ float NSHPParser::DecodeNormal10_10_10(uint32_t packed, int comp) {
     return val / 511.0f;
 }
 
-// Tristrip → GL_TRIANGLES (restart-aware)
-
 void NSHPParser::TristripToTriangles(const uint16_t* strip, size_t len,
     std::vector<uint16_t>& out) {
     std::vector<uint16_t> seg;
     seg.reserve(64);
-
     auto flush = [&]() {
         for (size_t i = 0; i + 2 < seg.size(); i++) {
             uint16_t a = seg[i], b = seg[i + 1], c = seg[i + 2];
@@ -49,7 +44,6 @@ void NSHPParser::TristripToTriangles(const uint16_t* strip, size_t len,
         }
         seg.clear();
         };
-
     for (size_t i = 0; i < len; i++) {
         if (strip[i] == 0xFFFF) flush();
         else                    seg.push_back(strip[i]);
@@ -57,28 +51,19 @@ void NSHPParser::TristripToTriangles(const uint16_t* strip, size_t len,
     flush();
 }
 
-// Vertex decoder
-
 void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
-    uint16_t vc, int stride, bool skinned,
-    NSHPMesh& out) {
+    uint16_t vc, int stride, bool skinned, NSHPMesh& out) {
     out.vertices.clear();
     out.vertices.reserve(vc);
-
     for (uint16_t i = 0; i < vc; i++) {
         const uint8_t* vd = data + vstart + i * stride;
         Vertex v;
-
         v.position[0] = ReadF32BE(vd + 0x00);
         v.position[1] = ReadF32BE(vd + 0x04);
         v.position[2] = ReadF32BE(vd + 0x08);
-
         if (skinned) {
-            // stride=32: weights@+0x0C, ids@+0x10, unknown@+0x14, UV f16@+0x1C
-            v.bone_weights[0] = vd[0x0C] / 255.f;
-            v.bone_weights[1] = vd[0x0D] / 255.f;
-            v.bone_weights[2] = vd[0x0E] / 255.f;
-            v.bone_weights[3] = vd[0x0F] / 255.f;
+            v.bone_weights[0] = vd[0x0C] / 255.f; v.bone_weights[1] = vd[0x0D] / 255.f;
+            v.bone_weights[2] = vd[0x0E] / 255.f; v.bone_weights[3] = vd[0x0F] / 255.f;
             v.bone_ids[0] = vd[0x10]; v.bone_ids[1] = vd[0x11];
             v.bone_ids[2] = vd[0x12]; v.bone_ids[3] = vd[0x13];
             float nx = int8_t(vd[0x14]) / 127.f, ny = int8_t(vd[0x15]) / 127.f, nz = int8_t(vd[0x16]) / 127.f;
@@ -88,60 +73,83 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
             v.uv[1] = HalfToFloat(ReadU16BE(vd + 0x1E));
         }
         else if (stride == 16) {
-            // position only — normal and UV stay zero
+            // position only
         }
         else {
-            // stride 20/24/28/48: normal 10:10:10:2 @+0x0C, UV i16/32767 @+0x10
+            // stride 20/24/28/48: normal 10:10:10:2 @+0x0C, UV @+0x10
+            // UV = base (i16/32767) + per-vertex delta (f16 at +0x14).
+            // Without the delta every vertex in a quad samples the same texel,
+            // producing flat-colour squares on leaf and canopy meshes.
             uint32_t packed = (uint32_t(vd[0x0C]) << 24) | (uint32_t(vd[0x0D]) << 16)
                 | (uint32_t(vd[0x0E]) << 8) | vd[0x0F];
             v.normal[0] = DecodeNormal10_10_10(packed, 0);
             v.normal[1] = DecodeNormal10_10_10(packed, 1);
             v.normal[2] = DecodeNormal10_10_10(packed, 2);
-            v.uv[0] = ReadI16BE(vd + 0x10) / 32767.f;
-            v.uv[1] = ReadI16BE(vd + 0x12) / 32767.f;
+            // UV encoding differs by stride:
+            // stride=24: the f16 pair at +0x14 are the actual UV coordinates.
+            //             The i16 pair at +0x10 is an atlas tile selector (same value
+            //             for all 4 verts of one quad — used by the PS3 shader).
+            // stride=28: the i16 pair at +0x10 /32767 are the UV coordinates.
+            //             The bytes at +0x14..+0x1B encode lightmap/secondary UV.
+            // stride=20/48: use i16 at +0x10 (same as stride=28).
+            // Stride-24: UV = f16 at +0x14/+0x16 (always).
+            // The i16 at +0x10/+0x12 is NOT a UV component — it encodes
+            // terrain blend weights or similar per-vertex data.
+            // Stride-28/20: UV = i16/32767 at +0x10.
+            // stride=24: two UV encoding modes depending on how f16 is used.
+            //
+            // TILING TERRAIN (|f16| > 1):  UV = i16/32767 + f16
+            //   f16 holds large tiling offsets (-10..10). Without i16, the integer
+            //   parts collapse to 0 after GL_REPEAT, making the terrain flat.
+            //   i16 provides the sub-pixel fractional part for proper 2D coverage.
+            //
+            // SPRITE / PROP (|f16| <= 1):  UV = f16 only
+            //   f16 holds the actual 0..1 corner positions of the sprite/quad.
+            //   i16 may vary across vertices (0..1 atlas selector); adding it to f16
+            //   pushes the combined UV over 1.0, causing a visible wrap seam.
+            if (stride == 24) {
+                const float fu = HalfToFloat(ReadU16BE(vd + 0x14));
+                const float fv = HalfToFloat(ReadU16BE(vd + 0x16));
+                if (std::abs(fu) > 1.0f || std::abs(fv) > 1.0f) {
+                    // Tiling terrain: needs i16 fractional base to avoid V-collapse
+                    v.uv[0] = ReadI16BE(vd + 0x10) / 32767.f + fu;
+                    v.uv[1] = ReadI16BE(vd + 0x12) / 32767.f + fv;
+                }
+                else {
+                    // Sprite / prop: f16 is already the full UV
+                    v.uv[0] = fu;
+                    v.uv[1] = fv;
+                }
+            }
+            else {
+                v.uv[0] = ReadI16BE(vd + 0x10) / 32767.f;
+                v.uv[1] = ReadI16BE(vd + 0x12) / 32767.f;
+            }
         }
-
         out.vertices.push_back(v);
     }
 }
 
-// TryStride
-// Tries to parse vertex+index data assuming vertex data starts at vstart.
-// Reads actual strip counts directly from face section headers (no size equation).
-// Allows up to 4 bytes of trailing chunk padding after the last index.
-
 bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
-    size_t vstart, uint16_t vc, uint16_t fc,
-    int stride, NSHPMesh& out) {
+    size_t vstart, uint16_t vc, uint16_t fc, int stride, NSHPMesh& out) {
     const size_t fs_off = vstart + size_t(vc) * stride;
     if (fs_off + size_t(fc) * 16 > chunk_end) return false;
-
-    // Validate first and last vertex positions
     for (int i : {0, vc - 1}) {
         const float px = ReadF32BE(data + vstart + i * stride);
         if (std::isnan(px) || std::isinf(px) || std::abs(px) > 10000.f) return false;
     }
-    // Also validate vertex 1 if available (avoids false positives on V[0]=(0,0,0))
     if (vc > 1) {
         const float px1 = ReadF32BE(data + vstart + stride);
         if (std::isnan(px1) || std::isinf(px1) || std::abs(px1) > 10000.f) return false;
     }
-
-    // Read actual strip counts from face section headers
     uint32_t total_raw = 0;
     for (uint16_t s = 0; s < fc; s++) {
         uint16_t sc = ReadU16BE(data + fs_off + s * 16 + 14);
-        if (sc < 3)        return false;   // need at least 3 indices
-        if (sc > vc * 8u)    return false;   // implausibly large
+        if (sc < 3 || sc > vc * 8u) return false;
         total_raw += sc;
     }
-
-    // Index block fits with ≤4 bytes padding
     const size_t idx_end = fs_off + size_t(fc) * 16 + total_raw * 2;
-    if (idx_end > chunk_end)        return false;
-    if (chunk_end - idx_end > 4)    return false;   // too much leftover
-
-    // Verify real (non-restart) indices are within [0, vc)
+    if (idx_end > chunk_end || chunk_end - idx_end > 4) return false;
     const size_t idx_base = fs_off + size_t(fc) * 16;
     uint16_t max_real = 0;
     uint32_t sample = std::min(total_raw, uint32_t(200));
@@ -150,26 +158,20 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
         if (v != 0xFFFF) max_real = std::max(max_real, v);
     }
     if (max_real >= vc) return false;
-
-    //  All checks passed — decode vertices and convert tristrips 
+    // Detect stride-24 UV mode from all vertex data before decoding.
+    // If any |f16@+0x14| > 2.0, both i16 and f16 contribute to the final UV.
     DecodeVertices(data, vstart, vc, stride, false, out);
     out.vertex_stride = stride;
-
     out.faceSections.clear();
     out.indices.clear();
     uint32_t cursor = 0;
-
-    // Collect all raw strip data first
     std::vector<uint16_t> raw;
     raw.reserve(total_raw);
     for (uint32_t i = 0; i < total_raw; i++)
         raw.push_back(ReadU16BE(data + idx_base + i * 2));
-
-    // Re-read per-section strip counts for section building
     std::vector<uint16_t> raw_counts(fc);
     for (uint16_t s = 0; s < fc; s++)
         raw_counts[s] = ReadU16BE(data + fs_off + s * 16 + 14);
-
     for (uint16_t s = 0; s < fc; s++) {
         FaceSection fs;
         fs.mat_id = ReadU16BE(data + fs_off + s * 16);
@@ -179,68 +181,41 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
         cursor += raw_counts[s];
         out.faceSections.push_back(fs);
     }
-
     return true;
 }
-
-//  TrySequential
-// Handles stride=48 meshes with a 12-byte footer instead of a tristrip section.
-// Footer layout: [mat_id:u16][0:u16][vc:u16][0:u16][0:u16][0:u16]
-// Vertices are drawn sequentially — no index buffer.
 
 bool NSHPParser::TrySequential(const uint8_t* data, size_t chunk_end,
     size_t vdata_start, uint16_t vc, NSHPMesh& out) {
     constexpr int SEQ_STRIDE = 48;
     const size_t footer_start = vdata_start + size_t(vc) * SEQ_STRIDE;
-
-    if (footer_start + 12 != chunk_end) return false;   // must be exactly 12 bytes left
-
-    // Footer u16[2] must equal vc
+    if (footer_start + 12 != chunk_end) return false;
     if (ReadU16BE(data + footer_start + 4) != vc) return false;
-
-    // Footer u16[3..5] must all be zero
     if (ReadU16BE(data + footer_start + 6) != 0) return false;
     if (ReadU16BE(data + footer_start + 8) != 0) return false;
     if (ReadU16BE(data + footer_start + 10) != 0) return false;
-
-    // Validate first vertex position
     const float px = ReadF32BE(data + vdata_start);
     if (std::isnan(px) || std::isinf(px) || std::abs(px) > 10000.f) return false;
-
-    // Decode vertices (same layout as stride=28 through first 28 bytes; rest unknown)
     DecodeVertices(data, vdata_start, vc, SEQ_STRIDE, false, out);
     out.vertex_stride = SEQ_STRIDE;
     out.draw_sequential = true;
-
-    // Build a single face section from the footer
     FaceSection fs;
-    fs.mat_id = ReadU16BE(data + footer_start);   // u16[0]
+    fs.mat_id = ReadU16BE(data + footer_start);
     fs.index_start = 0;
-    fs.index_count = 0;   // unused for sequential draw
+    fs.index_count = 0;
     out.faceSections.push_back(fs);
-
     return true;
 }
 
-// Parse 
-
 bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
-    if (size < 0x40) {
-        std::cerr << "[NSHP] Chunk too small (" << size << ")\n";
-        return false;
-    }
-
+    if (size < 0x40) { std::cerr << "[NSHP] Chunk too small (" << size << ")\n"; return false; }
     char name_buf[17] = {};
     std::memcpy(name_buf, data + 0x08, 16);
     out.name = name_buf;
-
     out.vertex_count = ReadU16BE(data + 0x1A);
     out.face_section_count = ReadU16BE(data + 0x1E);
     const uint8_t bone_count = data[0x20];
     out.has_bones = (bone_count > 0);
     out.has_skinning = out.has_bones;
-
-    // Locate boneIDList and find where vertex data begins 
     size_t off = 0x38;
     out.boneIDList.clear();
     for (uint8_t b = 0; b < bone_count; b++) {
@@ -248,48 +223,27 @@ bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
         out.boneIDList.push_back(ReadU16BE(data + off));
         off += 2;
     }
-    off = (off + 3u) & ~3u;   // 4-byte align
-
-    const size_t vdata_base = off;   // first possible vertex data position
-    // chunk_end = the real end of the NSHP chunk, read from the chunk size field.
-    // This must NOT use `size` because ChunkInspector passes m_ChunkData.size()
-    // = 24 + chunk.size, giving 24 extra bytes that would break the leftover check.
+    off = (off + 3u) & ~3u;
+    const size_t vdata_base = off;
     const size_t chunk_end = std::min(static_cast<size_t>(ReadU32BE(data + 4)), size);
-
     out.draw_sequential = false;
     out.vertices.clear();
     out.indices.clear();
     out.faceSections.clear();
-
     bool parsed = false;
-
     if (out.has_bones) {
-        // SKINNED — stride always 32
         parsed = TryStride(data, chunk_end, vdata_base, out.vertex_count,
             out.face_section_count, 32, out);
         if (parsed) {
-            // Re-decode with skinned=true (TryStride decoded as static)
             DecodeVertices(data, vdata_base, out.vertex_count, 32, true, out);
             out.vertex_stride = 32;
         }
-
     }
     else {
-        //  STATIC - probe two candidate vertex start positions
-        // Position A: immediately after boneIDList+align (vdata_base)
-        // Position B: vdata_base + 32  (32-byte pre-block present)
-        //
-        // The 32-byte pre-block is detected when:
-        //   - data[vdata_base+0..3] is a small u32 (≤ 255)
-        //   - data[vdata_base+4..31] are all zero
-        // We try position A first; if that fails, try position B.
-
         bool has_pre_block = false;
         if (vdata_base + 32 < chunk_end) {
             uint32_t hint = ReadU16BE(data + vdata_base) << 16 | ReadU16BE(data + vdata_base + 2);
-            // hint should be a small u32, i.e. high bytes zero
             if (data[vdata_base] == 0 && data[vdata_base + 1] == 0) {
-                // Check bytes 4..31 are zero
                 bool all_zero = true;
                 for (int z = 4; z < 32 && all_zero; z++)
                     if (data[vdata_base + z] != 0) all_zero = false;
@@ -297,74 +251,41 @@ bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
             }
             (void)hint;
         }
-
         const size_t vstart_a = vdata_base;
         const size_t vstart_b = vdata_base + 32;
-
-        // Try each candidate position against all known static strides
-        // in order from most common to least common
-        const int STATIC_STRIDES[] = { 24, 28, 20, 16, 0 };   // 0 = sentinel
-
-        // Helper lambda to try all static strides at one start position
+        const int STATIC_STRIDES[] = { 24, 28, 20, 16, 0 };
         auto try_pos = [&](size_t vstart) -> bool {
-            // Sequential (stride=48, no-index) — try first
-            if (TrySequential(data, chunk_end, vstart, out.vertex_count, out)) {
-                return true;
-            }
-            for (const int* sp = STATIC_STRIDES; *sp; ++sp) {
+            if (TrySequential(data, chunk_end, vstart, out.vertex_count, out)) return true;
+            for (const int* sp = STATIC_STRIDES; *sp; ++sp)
                 if (TryStride(data, chunk_end, vstart, out.vertex_count,
-                    out.face_section_count, *sp, out)) {
-                    return true;
-                }
-            }
+                    out.face_section_count, *sp, out)) return true;
             return false;
             };
-
-        if (try_pos(vstart_a)) {
-            parsed = true;
-        }
-        else if (has_pre_block && try_pos(vstart_b)) {
-            parsed = true;
-        }
-        else if (!has_pre_block && try_pos(vstart_b)) {
-            // Try pre-block position even without the signature, as a fallback
-            parsed = true;
-        }
+        if (try_pos(vstart_a)) parsed = true;
+        else if (has_pre_block && try_pos(vstart_b)) parsed = true;
+        else if (!has_pre_block && try_pos(vstart_b)) parsed = true;
     }
-
-    if (!parsed) {
-        std::cerr << "[NSHP] '" << out.name << "': failed to detect vertex format\n";
-        return false;
-    }
-
-    // Backward-compatible fields 
+    if (!parsed) { std::cerr << "[NSHP] '" << out.name << "': failed to detect vertex format\n"; return false; }
     if (!out.faceSections.empty()) {
         out.texture_id = static_cast<uint8_t>(out.faceSections[0].mat_id & 0xFF);
         out.has_texture = true;
     }
-
     std::cout << "[NSHP] '" << out.name << "'"
         << "  stride=" << out.vertex_stride
         << "  verts=" << out.vertices.size()
-        << "  tris=" << (out.draw_sequential ? out.vertices.size() / 3
-            : out.indices.size() / 3)
+        << "  tris=" << (out.draw_sequential ? out.vertices.size() / 3 : out.indices.size() / 3)
         << (out.has_bones ? "  SKINNED" : "  static")
         << (out.draw_sequential ? "  SEQ-DRAW" : "")
         << "\n";
-
     return !out.vertices.empty();
 }
-
-//  NMTR parser
 
 bool NSHPParser::ParseNMTR(const uint8_t* data, size_t size,
     std::vector<NMTREntry>& out) {
     out.clear();
     if (size < 8 + 96) return false;
-
     const size_t mat_count = (size - 8) / 96;
     out.reserve(mat_count);
-
     for (size_t m = 0; m < mat_count; m++) {
         const uint8_t* entry = data + 8 + m * 96;
         NMTREntry e;
@@ -374,9 +295,9 @@ bool NSHPParser::ParseNMTR(const uint8_t* data, size_t size,
             e.diffuse_img_id = static_cast<int16_t>(ReadU16BE(entry + 0x04));
         }
         e.alpha_img_id = ReadI16BE(entry + 0x30);
+        e.alpha_cutout = (ReadU16BE(entry + 0x44) == 1);
         out.push_back(e);
     }
-
     std::cout << "[NMTR] " << out.size() << " materials\n";
     return !out.empty();
 }

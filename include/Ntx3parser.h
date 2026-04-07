@@ -57,14 +57,18 @@ public:
         uint16_t* out_width = nullptr,
         uint16_t* out_height = nullptr);
 
-private:
-    static uint16_t ReadU16BE(const uint8_t* data);
-    static uint32_t ReadU32BE(const uint8_t* data);
-
+public:
+    // Called externally for .bmd/.e inline NTX3 (no block-swap — use NTX3Parser,
+    // not P3TexParser::DecompressDXT5, for these files).
     static bool DecompressDXT1(const uint8_t* src, uint16_t width,
         uint16_t height, std::vector<uint8_t>& rgba);
     static bool DecompressDXT5(const uint8_t* src, uint16_t width,
-        uint16_t height, std::vector<uint8_t>& rgba);
+        uint16_t height, std::vector<uint8_t>& rgba,
+        bool ps3_swap = false);
+
+private:
+    static uint16_t ReadU16BE(const uint8_t* data);
+    static uint32_t ReadU32BE(const uint8_t* data);
 
     // Returns true if all 16 bytes of a DXT block are 0xEE (fill block).
     static bool IsEEFillBlock(const uint8_t* block);

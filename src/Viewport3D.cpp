@@ -35,27 +35,31 @@ uniform vec3      lightPos;
 uniform vec3      viewPos;
 uniform vec3      objectColor;
 uniform sampler2D u_Diffuse;
+uniform sampler2D u_AlphaMask;
 uniform int       u_UseTexture;
+uniform int       u_HasAlphaMask;
+uniform float     u_AlphaThreshold;
 void main(){
-    // Use geometric (face) normal derived from screen-space derivatives.
-    // The PS3 vertex normals are in a different coordinate convention and
-    // produce dark patches when used directly.  The geometric normal is
-    // always correct and gives clean flat-shaded lighting.
-    vec3 norm = normalize(cross(dFdx(FragPos), dFdy(FragPos)));
-    // Ensure normal always faces the camera (handle both winding orders)
-    if (!gl_FrontFacing) norm = -norm;
+    vec4 texSample = vec4(1.0);
+    if (u_UseTexture != 0) {
+        texSample = texture(u_Diffuse, TexCoord);
+        // Alpha test — threshold depends on texture format:
+        //   DXT1 punch-through: 0.5 (binary: 0 or 1)
+        //   DXT5 full alpha:    0.01 (discard only near-fully-transparent pixels)
+        if (texSample.a < u_AlphaThreshold) discard;
+    }
+    // Separate greyscale alpha mask texture (e.g. flowers on coloured background)
+    if (u_HasAlphaMask != 0) {
+        float mask = texture(u_AlphaMask, TexCoord).r;
+        if (mask < 0.5) discard;
+    }
 
-    // Two-light setup: key light follows camera, fill light from opposite side
-    vec3 keyDir  = normalize(lightPos - FragPos);
-    vec3 fillDir = normalize(-lightPos);
-    float key    = max(dot(norm, keyDir),  0.0);
-    float fill   = max(dot(norm, fillDir), 0.0) * 0.35;
-    vec3 ambient = 0.40 * vec3(1.0);
-    vec3 lighting = ambient + key * vec3(1.0) + fill * vec3(1.0);
-    vec3 baseColor = (u_UseTexture != 0)
-        ? texture(u_Diffuse, TexCoord).rgb
-        : objectColor;
-    FragColor = vec4(lighting * baseColor, 1.0);
+    // Unlit: output texture colour directly, no lighting math.
+    // Vertex normals in PS3 meshes are often imprecise enough that any lighting
+    // model introduces visible artefacts (graininess, shadow patches).
+    vec3 baseColor = (u_UseTexture != 0) ? texSample.rgb : objectColor;
+    float outAlpha = (u_UseTexture != 0) ? texSample.a : 1.0;
+    FragColor = vec4(baseColor, outAlpha);
 })";
 
 static const char* BONE_VERT = R"(
@@ -205,6 +209,9 @@ void Viewport3D::LoadModel(NMDLModel& model) {
     }
 
     m_MatToTex = std::move(model.mat_to_tex);
+    m_MatToAlpha = std::move(model.mat_to_alpha);
+    m_MatClampIds = std::move(model.mat_clamp_ids);
+    m_MatBlendIds = std::move(model.mat_blend_ids);
     m_ModelTextures = std::move(model.owned_textures);
     m_HasModel = !m_ModelMeshes.empty();
 
@@ -357,7 +364,7 @@ void Viewport3D::Render() {
     glm::mat4 model = glm::mat4(1.0f);
     if (m_FlipY) model = glm::scale(model, glm::vec3(1.0f, -1.0f, 1.0f));
 
-    // Draw single mesh
+    // draw single mesh
     if (m_HasMesh && m_ShowMesh && m_VAO) {
         m_MeshShader->Use();
         m_MeshShader->SetMat4("model", model);
@@ -385,7 +392,7 @@ void Viewport3D::Render() {
         glBindVertexArray(0);
     }
 
-    // Draw NMDL model (multi-mesh, per-section textures)
+    //Draw NMDL model (multi-mesh, per-section textures)
     if (m_HasModel && m_ShowMesh) {
         m_MeshShader->Use();
         m_MeshShader->SetMat4("model", model);
@@ -395,6 +402,9 @@ void Viewport3D::Render() {
         m_MeshShader->SetVec3("viewPos", camPos);
         m_MeshShader->SetVec3("objectColor", glm::vec3(0.72f, 0.72f, 0.88f));
         m_MeshShader->SetInt("u_Diffuse", 0);
+        m_MeshShader->SetInt("u_AlphaMask", 1);
+        m_MeshShader->SetInt("u_HasAlphaMask", 0);
+        m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
 
         for (const auto& gpu : m_ModelMeshes) {
             if (!gpu.VAO) continue;
@@ -419,10 +429,39 @@ void Viewport3D::Render() {
                     if (it != m_MatToTex.end() && it->second != 0) {
                         glActiveTexture(GL_TEXTURE0);
                         glBindTexture(GL_TEXTURE_2D, it->second);
+                        GLenum wrap = m_MatClampIds.count(sec.mat_id)
+                            ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
                         m_MeshShader->SetInt("u_UseTexture", 1);
+                        // DXT5: full 8-bit alpha → GL_BLEND + low discard threshold.
+                        // DXT1: binary punch-through → no blend, threshold=0.5.
+                        if (m_MatBlendIds.count(sec.mat_id)) {
+                            glEnable(GL_BLEND);
+                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                            glDepthMask(GL_FALSE);  // transparent: don't occlude geometry behind
+                            m_MeshShader->SetFloat("u_AlphaThreshold", 0.01f);
+                        }
+                        else {
+                            glDisable(GL_BLEND);
+                            glDepthMask(GL_TRUE);
+                            m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
+                        }
                     }
                     else {
                         m_MeshShader->SetInt("u_UseTexture", 0);
+                        glDisable(GL_BLEND);
+                        m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
+                    }
+                    auto ita = m_MatToAlpha.find(sec.mat_id);
+                    if (ita != m_MatToAlpha.end() && ita->second != 0) {
+                        glActiveTexture(GL_TEXTURE1);
+                        glBindTexture(GL_TEXTURE_2D, ita->second);
+                        m_MeshShader->SetInt("u_AlphaMask", 1);
+                        m_MeshShader->SetInt("u_HasAlphaMask", 1);
+                    }
+                    else {
+                        m_MeshShader->SetInt("u_HasAlphaMask", 0);
                     }
                     glDrawElements(GL_TRIANGLES,
                         (GLsizei)sec.index_count,
@@ -432,10 +471,15 @@ void Viewport3D::Render() {
             }
             glBindVertexArray(0);
         }
+        glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);  // always restore depth writes after model draw
     }
 
-    // Draw skeleton
+    //Draw skeleton
     if (m_HasSkeleton && m_ShowSkeleton) {
         m_BoneShader->Use();
         m_BoneShader->SetMat4("view", view);
@@ -514,6 +558,9 @@ void Viewport3D::CleanupModelGL() {
     for (GLuint t : m_ModelTextures) if (t) glDeleteTextures(1, &t);
     m_ModelTextures.clear();
     m_MatToTex.clear();
+    m_MatToAlpha.clear();
+    m_MatClampIds.clear();
+    m_MatBlendIds.clear();
 }
 
 void Viewport3D::CleanupSkeletonGL() {

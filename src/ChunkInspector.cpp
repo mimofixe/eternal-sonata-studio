@@ -5,6 +5,8 @@
 #include <cstring>
 #include <iostream>
 #include "Viewport3D.h"
+#include "FileDialog.h"
+#include "Ntx3parser.h"
 
 ChunkInspector::ChunkInspector()
     : m_HasChunk(false), m_Viewport(nullptr), m_P3TexParser(nullptr),
@@ -13,6 +15,7 @@ ChunkInspector::ChunkInspector()
 
 ChunkInspector::~ChunkInspector() {
     m_TextureCache.Clear();
+    for (GLuint t : m_MapTextures) if (t) glDeleteTextures(1, &t);
 }
 
 void ChunkInspector::SetViewport(Viewport3D* viewport) {
@@ -269,7 +272,7 @@ void ChunkInspector::RenderNSHPInfo() {
                     ImGui::Text("Dimensions: %dx%d", tex->width, tex->height);
                     ImGui::Text("Data size: %zu bytes (%.2f KB)", tex->size, tex->size / 1024.0f);
 
-                    if (tex->format == 0x86) {
+                    if ((tex->format & 0xDF) == 0x86) {
                         ImGui::Text("Format: DXT1 compressed");
                     }
                     else {
@@ -291,7 +294,7 @@ void ChunkInspector::RenderNSHPInfo() {
                             std::cout << "Decompressing texture " << (int)m_CachedMesh.texture_id << "..." << std::endl;
 
                             std::vector<uint8_t> rgba;
-                            if (tex->format == 0x86) {
+                            if ((tex->format & 0xDF) == 0x86) {
                                 std::cout << "  Format: DXT1" << std::endl;
                                 rgba = P3TexParser::DecompressDXT1(tex->data.data(), tex->width, tex->height);
                             }
@@ -385,8 +388,7 @@ void ChunkInspector::RenderNMDLInfo() {
     ImGui::Text("NMDL Model");
     ImGui::Separator();
 
-    // Show basic header info
-    // NMDL w[2]=mat_count at chunk+0x22, w[4]=bone_count at chunk+0x26
+    // Header info: NMDL w[2]=mat_count at +0x22, w[4]=bone_count at +0x26
     if (m_ChunkData.size() >= 0x30) {
         auto u16be = [](const uint8_t* d) { return uint16_t((d[0] << 8) | d[1]); };
         const uint8_t* hdr = m_ChunkData.data();
@@ -404,14 +406,137 @@ void ChunkInspector::RenderNMDLInfo() {
         return;
     }
 
+    // ── Map texture loading ───────────────────────────────────────────────────
+    int expected_tex_count = 0;
+    if (m_FileData && m_ChunkData.size() >= 8) {
+        auto u16be_fn = [](const uint8_t* d) { return uint16_t((d[0] << 8) | d[1]); };
+        auto u32be_fn = [](const uint8_t* d) {
+            return (uint32_t(d[0]) << 24) | (uint32_t(d[1]) << 16) | (uint32_t(d[2]) << 8) | d[3]; };
+        const uint8_t* fd = m_FileData->data();
+        size_t fs = m_FileData->size();
+        size_t nmdl_end = std::min(
+            m_CurrentChunk.offset + size_t(m_CurrentChunk.size), fs);
+        size_t p2 = m_CurrentChunk.offset + 8;
+        while (p2 + 8 <= nmdl_end) {
+            const uint8_t* pp = fd + p2;
+            uint32_t s2 = u32be_fn(pp + 4);
+            if (s2 >= 8 && p2 + s2 <= nmdl_end) {
+                if (memcmp(pp, "NMTR", 4) == 0) {
+                    int mc = (int)((s2 - 8) / 96);
+                    int mx = -1;
+                    for (int m = 0; m < mc; m++) {
+                        const uint8_t* entry = pp + 8 + m * 96;
+                        if (u16be_fn(entry + 0x0A) == 1) {
+                            int idx = (int)u16be_fn(entry + 0x04);
+                            if (idx > mx) mx = idx;
+                        }
+                    }
+                    if (mx >= 0) expected_tex_count = mx + 1;
+                    break;
+                }
+                p2 += s2;
+            }
+            else { p2 += 4; }
+        }
+    }
+
+    ImGui::Text("Map textures (.p3tex):");
+    if (expected_tex_count > 0 && m_MapTextures.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+            "(needs p3tex with >= %d textures)", expected_tex_count);
+    }
+
+    if (!m_MapTextures.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
+            "%d textures loaded", (int)m_MapTextures.size());
+        if (ImGui::SmallButton("Clear##maptex")) {
+            for (GLuint t : m_MapTextures) if (t) glDeleteTextures(1, &t);
+            m_MapTextures.clear();
+            m_MapTexDXT5.clear();
+        }
+    }
+    else {
+        ImGui::SameLine();
+        ImGui::TextDisabled("none");
+    }
+
+    if (ImGui::Button("Load .p3tex for this map...", ImVec2(-1, 0))) {
+        std::string path = FileDialog::OpenFile(
+            "P3TEX Files\0*.p3tex\0All Files\0*.*\0");
+        if (!path.empty()) {
+            P3TexParser tempParser;
+            if (tempParser.Load(path)) {
+                m_MapTextures.clear();
+                m_MapTexDXT5.clear();
+                // Upload all textures to GPU and collect their handles
+                for (size_t i = 0; i < tempParser.GetTextureCount(); i++) {
+                    const P3Texture* tex = tempParser.GetTexture((uint8_t)i);
+                    if (!tex || tex->width == 0 || tex->height == 0) {
+                        m_MapTextures.push_back(0);
+                        m_MapTexDXT5.push_back(false);
+                        continue;
+                    }
+                    std::vector<uint8_t> rgba;
+                    if ((tex->format & 0xDF) == 0x86)
+                        rgba = P3TexParser::DecompressDXT1(
+                            tex->data.data(), tex->width, tex->height);
+                    else
+                        rgba = P3TexParser::DecompressDXT5(
+                            tex->data.data(), tex->width, tex->height);
+
+                    GLuint glTex = 0;
+                    if (!rgba.empty()) {
+                        glGenTextures(1, &glTex);
+                        glBindTexture(GL_TEXTURE_2D, glTex);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                            tex->width, tex->height, 0,
+                            GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                        // No mipmaps — atlas textures must not be mip-filtered.
+                        // glGenerateMipmap on an atlas produces garbage mip levels
+                        // which GL_LINEAR_MIPMAP_LINEAR then samples → rainbow artefacts.
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            GL_REPEAT);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            GL_REPEAT);
+                        glBindTexture(GL_TEXTURE_2D, 0);
+                    }
+                    m_MapTextures.push_back(glTex);
+                    m_MapTexDXT5.push_back(tex->format != 0x86);
+                }
+                std::cout << "[ChunkInspector] Loaded " << m_MapTextures.size()
+                    << " map textures from " << path << "\n";
+            }
+        }
+    }
+
+    ImGui::Separator();
+
+    // ── Load model button ─────────────────────────────────────────────────────
     if (ImGui::Button("Load Textured Model in Viewport", ImVec2(-1, 0))) {
         if (m_FileData && !m_FileData->empty()) {
             NMDLModel mdl;
+            const std::vector<GLuint>* extTex =
+                m_MapTextures.empty() ? nullptr : &m_MapTextures;
+
+            // Pass the DXT5 flag vector so NMDLLoader can enable GL_BLEND
+            // for materials whose diffuse texture uses full 8-bit alpha (DXT5).
+            const std::vector<bool>* extDXT5ptr = nullptr;
+            if (extTex && !m_MapTexDXT5.empty())
+                extDXT5ptr = &m_MapTexDXT5;
+
             bool ok = NMDLLoader::Load(
                 m_FileData->data(),
                 m_FileData->size(),
                 m_CurrentChunk.offset,
-                mdl);
+                mdl,
+                extTex,
+                extDXT5ptr);
 
             if (ok) {
                 m_Viewport->LoadModel(mdl);
@@ -473,7 +598,7 @@ void ChunkInspector::RenderNTX3Info() {
     if (width > 0 && height > 0) {
         ImGui::Text("Dimensions: %dx%d", width, height);
 
-        if (format_byte == 0x86) {
+        if ((format_byte & 0xDF) == 0x86) {
             ImGui::Text("Format: DXT1 compressed");
         }
         else {
@@ -502,22 +627,39 @@ void ChunkInspector::RenderNTX3Info() {
             if (ImGui::Button("Generate Preview", ImVec2(150, 0))) {
                 std::cout << "Decompressing NTX3 texture (" << width << "x" << height << ")..." << std::endl;
 
-                std::vector<uint8_t> texture_data(data_size);
-                memcpy(texture_data.data(), m_ChunkData.data() + 128, data_size);
-
+                // NTX3 pixel data starts at +0x88 (136-byte header).
+                // Use NTX3Parser (no block-swap) — P3TexParser::DecompressDXT5 has a
+                // swap only valid for .p3tex external textures, not .bmd/.e inline NTX3.
+                const uint8_t* dxt_data = m_ChunkData.data() + 0x88;
                 std::vector<uint8_t> rgba;
-                if (format_byte == 0x86) {
+                if ((format_byte & 0xDF) == 0x86) {
                     std::cout << "  Format: DXT1" << std::endl;
-                    rgba = P3TexParser::DecompressDXT1(texture_data.data(), width, height);
+                    rgba.resize(size_t(width) * height * 4, 0);
+                    NTX3Parser::DecompressDXT1(dxt_data, width, height, rgba);
+                }
+                else if (format_byte == 0xA5) {
+                    // Raw RGBA8 — actual height = data_size / (width * 4)
+                    const size_t actual_h = data_size / (width * 4);
+                    height = static_cast<uint16_t>(actual_h);
+                    std::cout << "  Format: RGBA8 raw (" << width << "x" << height << ")" << std::endl;
+                    rgba.resize(size_t(width) * height * 4, 0);
+                    std::memcpy(rgba.data(), dxt_data, rgba.size());
                 }
                 else {
-                    std::cout << "  Format: DXT5" << std::endl;
-                    rgba = P3TexParser::DecompressDXT5(texture_data.data(), width, height);
+                    // .bmd files start with 'BMD ' — they store DXT5 with swapped halves.
+                    const bool is_bmd = (m_FileData && m_FileData->size() >= 4 &&
+                        (*m_FileData)[0] == 'B' && (*m_FileData)[1] == 'M' &&
+                        (*m_FileData)[2] == 'D' && (*m_FileData)[3] == ' ');
+                    std::cout << "  Format: DXT5 (bmd=" << is_bmd << ")" << std::endl;
+                    rgba.resize(size_t(width) * height * 4, 0);
+                    NTX3Parser::DecompressDXT5(dxt_data, width, height, rgba, is_bmd);
                 }
 
                 glGenTextures(1, &cachedTexture);
                 glBindTexture(GL_TEXTURE_2D, cachedTexture);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -765,7 +907,7 @@ void ChunkInspector::RenderNBN2Info() {
             : b.IsEffector() ? ImVec4(0.8f, 1.0f, 0.6f, 1.0f)
             : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
         ImGui::TextColored(col,
-            "[%3d] %-18s  par=%d  rot=(%.0f°,%.0f°,%.0f°)  "
+            "[%3d] %-18s  par=%d  rot=(%.0f\xc2\xb0,%.0f\xc2\xb0,%.0f\xc2\xb0)  "
             "pos=(%.3f,%.3f,%.3f)",
             i, b.name.c_str(), (int)b.parent_idx,
             b.rot_x * (180.f / 3.14159f),
