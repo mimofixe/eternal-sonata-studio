@@ -520,6 +520,41 @@ void ChunkInspector::RenderNMDLInfo() {
     // ── Load model button ─────────────────────────────────────────────────────
     if (ImGui::Button("Load Textured Model in Viewport", ImVec2(-1, 0))) {
         if (m_FileData && !m_FileData->empty()) {
+
+            // Scan file for NLIT chunk and extract scene lighting
+            if (m_Viewport) {
+                m_Viewport->ClearSceneLighting();
+                uint8_t amb_r = 180, amb_g = 180, amb_b = 180;
+                uint8_t dir_r = 220, dir_g = 220, dir_b = 220;
+                bool found_amb = false, found_dir = false;
+                const uint8_t* fd = m_FileData->data();
+                size_t fs = m_FileData->size();
+                size_t sp = 0;
+                while (sp + 8 <= fs) {
+                    if (memcmp(fd + sp, "NLIT", 4) == 0) {
+                        uint32_t nsz = (uint32_t(fd[sp + 4]) << 24) | (uint32_t(fd[sp + 5]) << 16) | (uint32_t(fd[sp + 6]) << 8) | fd[sp + 7];
+                        size_t ep = sp + 8;
+                        while (ep + 48 <= sp + nsz) {
+                            const uint8_t* entry = fd + ep;
+                            char ename[17]{}; memcpy(ename, entry, 16);
+                            uint8_t type_b = entry[16];
+                            uint8_t r = entry[20], g = entry[21], b = entry[22];
+                            if (type_b == 0x00 && !found_amb) { // ambient
+                                amb_r = r; amb_g = g; amb_b = b; found_amb = true;
+                            }
+                            else if (type_b == 0x01 && !found_dir) { // directional
+                                dir_r = r; dir_g = g; dir_b = b; found_dir = true;
+                            }
+                            ep += 48;
+                        }
+                        break;
+                    }
+                    sp += 4;
+                }
+                if (found_amb || found_dir)
+                    m_Viewport->SetSceneLighting(amb_r, amb_g, amb_b, dir_r, dir_g, dir_b);
+            }
+
             NMDLModel mdl;
             const std::vector<GLuint>* extTex =
                 m_MapTextures.empty() ? nullptr : &m_MapTextures;

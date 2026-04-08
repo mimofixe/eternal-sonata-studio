@@ -55,6 +55,7 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
     uint16_t vc, int stride, bool skinned, NSHPMesh& out) {
     out.vertices.clear();
     out.vertices.reserve(vc);
+
     for (uint16_t i = 0; i < vc; i++) {
         const uint8_t* vd = data + vstart + i * stride;
         Vertex v;
@@ -108,18 +109,10 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
             //   i16 may vary across vertices (0..1 atlas selector); adding it to f16
             //   pushes the combined UV over 1.0, causing a visible wrap seam.
             if (stride == 24) {
-                const float fu = HalfToFloat(ReadU16BE(vd + 0x14));
-                const float fv = HalfToFloat(ReadU16BE(vd + 0x16));
-                if (std::abs(fu) > 1.0f || std::abs(fv) > 1.0f) {
-                    // Tiling terrain: needs i16 fractional base to avoid V-collapse
-                    v.uv[0] = ReadI16BE(vd + 0x10) / 32767.f + fu;
-                    v.uv[1] = ReadI16BE(vd + 0x12) / 32767.f + fv;
-                }
-                else {
-                    // Sprite / prop: f16 is already the full UV
-                    v.uv[0] = fu;
-                    v.uv[1] = fv;
-                }
+                // Stride-24: UV is always the f16 pair at +0x14/+0x16.
+                // The i16 at +0x10/+0x12 is not a UV component.
+                v.uv[0] = HalfToFloat(ReadU16BE(vd + 0x14));
+                v.uv[1] = HalfToFloat(ReadU16BE(vd + 0x16));
             }
             else {
                 v.uv[0] = ReadI16BE(vd + 0x10) / 32767.f;

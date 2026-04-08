@@ -3,6 +3,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <cfloat>
 
 // Shaders 
@@ -39,6 +40,10 @@ uniform sampler2D u_AlphaMask;
 uniform int       u_UseTexture;
 uniform int       u_HasAlphaMask;
 uniform float     u_AlphaThreshold;
+uniform int       u_EnableLighting;
+uniform vec3      u_AmbientColor;
+uniform vec3      u_DirLightColor;
+uniform vec3      u_DirLightDir;
 void main(){
     vec4 texSample = vec4(1.0);
     if (u_UseTexture != 0) {
@@ -54,12 +59,18 @@ void main(){
         if (mask < 0.5) discard;
     }
 
-    // Unlit: output texture colour directly, no lighting math.
-    // Vertex normals in PS3 meshes are often imprecise enough that any lighting
-    // model introduces visible artefacts (graininess, shadow patches).
     vec3 baseColor = (u_UseTexture != 0) ? texSample.rgb : objectColor;
     float outAlpha = (u_UseTexture != 0) ? texSample.a : 1.0;
-    FragColor = vec4(baseColor, outAlpha);
+
+    if (u_EnableLighting != 0) {
+        vec3 N = normalize(Normal);
+        if (!gl_FrontFacing) N = -N;
+        float ndotl = max(dot(N, u_DirLightDir), 0.0);
+        vec3 lit = u_AmbientColor * baseColor + u_DirLightColor * baseColor * ndotl;
+        FragColor = vec4(lit, outAlpha);
+    } else {
+        FragColor = vec4(baseColor, outAlpha);
+    }
 })";
 
 static const char* BONE_VERT = R"(
@@ -273,6 +284,22 @@ void Viewport3D::LoadSkeleton(const std::vector<Bone>& bones) {
     std::cout << "[Viewport3D] Skeleton: " << bones.size() << " bones\n";
 }
 
+void Viewport3D::SetSceneLighting(uint8_t ar, uint8_t ag, uint8_t ab,
+    uint8_t dr, uint8_t dg, uint8_t db) {
+    m_AmbientColor = glm::vec3(ar / 255.0f, ag / 255.0f, ab / 255.0f);
+    m_DirLightColor = glm::vec3(dr / 255.0f, dg / 255.0f, db / 255.0f);
+    m_HasSceneLighting = true;
+}
+
+void Viewport3D::ClearSceneLighting() {
+    m_HasSceneLighting = false;
+    m_EnableLighting = false;
+    m_AmbientColor = glm::vec3(1.0f);
+    m_DirLightColor = glm::vec3(1.0f);
+    m_DirLightPitch = 45.0f;
+    m_DirLightYaw = 45.0f;
+}
+
 void Viewport3D::ClearSkeleton() {
     CleanupSkeletonGL();
     m_HasSkeleton = false;
@@ -295,6 +322,26 @@ void Viewport3D::Render() {
     const bool hasSomething = m_HasMesh || m_HasModel || m_HasSkeleton;
     if (m_HasMesh || m_HasModel) {
         ImGui::Checkbox("Mesh", &m_ShowMesh);
+        if (m_HasModel && m_HasSceneLighting) {
+            ImGui::SameLine();
+            ImGui::Separator();
+            ImGui::SameLine();
+            if (m_EnableLighting)
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
+            else
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
+            if (ImGui::Button("Scene Lighting"))
+                m_EnableLighting = !m_EnableLighting;
+            ImGui::PopStyleColor();
+            if (m_EnableLighting) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90);
+                ImGui::SliderFloat("Pitch##lit", &m_DirLightPitch, 0.0f, 90.0f, "%.0f°");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90);
+                ImGui::SliderFloat("Yaw##lit", &m_DirLightYaw, 0.0f, 360.0f, "%.0f°");
+            }
+        }
         ImGui::SameLine();
     }
     if (m_HasSkeleton) {
@@ -364,7 +411,7 @@ void Viewport3D::Render() {
     glm::mat4 model = glm::mat4(1.0f);
     if (m_FlipY) model = glm::scale(model, glm::vec3(1.0f, -1.0f, 1.0f));
 
-    // draw single mesh
+    // ── Draw single mesh ─────────────────────────────────────────────────────
     if (m_HasMesh && m_ShowMesh && m_VAO) {
         m_MeshShader->Use();
         m_MeshShader->SetMat4("model", model);
@@ -392,7 +439,7 @@ void Viewport3D::Render() {
         glBindVertexArray(0);
     }
 
-    //Draw NMDL model (multi-mesh, per-section textures)
+    // ── Draw NMDL model (multi-mesh, per-section textures) ───────────────────
     if (m_HasModel && m_ShowMesh) {
         m_MeshShader->Use();
         m_MeshShader->SetMat4("model", model);
@@ -405,6 +452,19 @@ void Viewport3D::Render() {
         m_MeshShader->SetInt("u_AlphaMask", 1);
         m_MeshShader->SetInt("u_HasAlphaMask", 0);
         m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
+
+        // Scene lighting uniforms
+        m_MeshShader->SetInt("u_EnableLighting", m_EnableLighting ? 1 : 0);
+        {
+            float pitch = glm::radians(m_DirLightPitch);
+            float yaw = glm::radians(m_DirLightYaw);
+            glm::vec3 dir(std::cos(pitch) * std::sin(yaw),
+                std::sin(pitch),
+                std::cos(pitch) * std::cos(yaw));
+            m_MeshShader->SetVec3("u_DirLightDir", glm::normalize(dir));
+            m_MeshShader->SetVec3("u_AmbientColor", m_AmbientColor);
+            m_MeshShader->SetVec3("u_DirLightColor", m_DirLightColor);
+        }
 
         for (const auto& gpu : m_ModelMeshes) {
             if (!gpu.VAO) continue;
@@ -479,7 +539,7 @@ void Viewport3D::Render() {
         glDepthMask(GL_TRUE);  // always restore depth writes after model draw
     }
 
-    //Draw skeleton
+    // ── Draw skeleton ─────────────────────────────────────────────────────────
     if (m_HasSkeleton && m_ShowSkeleton) {
         m_BoneShader->Use();
         m_BoneShader->SetMat4("view", view);

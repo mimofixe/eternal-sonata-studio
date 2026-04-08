@@ -42,6 +42,12 @@ public:
 
     void Render();
 
+    // Scene lighting from NLIT chunk.
+    // ambient_rgb and dir_rgb are 0-255 byte colours from the NLIT data.
+    void SetSceneLighting(uint8_t ambient_r, uint8_t ambient_g, uint8_t ambient_b,
+        uint8_t dir_r, uint8_t dir_g, uint8_t dir_b);
+    void ClearSceneLighting();
+
 private:
     void CleanupMeshGL();
     void CleanupModelGL();
@@ -80,6 +86,13 @@ private:
     bool m_ShowMesh = true;
     bool m_ShowSkeleton = true;
     bool m_FlipY = false;
+    // Scene lighting state
+    bool      m_EnableLighting = false;
+    bool      m_HasSceneLighting = false;
+    glm::vec3 m_AmbientColor = glm::vec3(1.0f);
+    glm::vec3 m_DirLightColor = glm::vec3(1.0f);
+    float     m_DirLightPitch = 45.0f;  // degrees from horizontal
+    float     m_DirLightYaw = 45.0f;  // degrees around Y axis
 
     // Offscreen framebuffer
     GLuint m_FBO = 0, m_FBOTex = 0, m_FBORbo = 0;
