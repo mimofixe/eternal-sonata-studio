@@ -62,6 +62,8 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 
 **Terrain UV** -- stride-24 map meshes use a two-field UV: `UV = i16/32767 + f16`. The f16 field alone collapses to zero after `GL_REPEAT` for integer offset values. The i16 component provides the fractional base for correct texture coverage. Sprite/prop meshes on the same stride use f16 only, detected per-vertex by `|f16| > 1.0`.
 
+**Scene lighting** -- when a map model is loaded, a **Scene Lighting** toggle appears in the viewport toolbar if NLIT data is present. Enabling it switches to an ambient + directional lighting model using colours read from the NLIT chunk. Pitch and Yaw sliders let you adjust the light direction interactively. Lighting is disabled by default; unlit output matches the raw texture colours exactly.
+
 ### Skeleton Viewing
 
 - NBN2 bone parser - confirmed layout from cross-referencing a 2015 Blender importer
@@ -195,7 +197,7 @@ Archive containing multiple NTX3 textures. Pixel data for each chunk starts at `
 - Stride 16: position only (water, collision geometry)
 - Stride 20: position + 10:10:10:2 packed normal + UV (i16/32767)
 - Stride 24: position + normal + two-field UV (`i16/32767 + f16` for tiling terrain; `f16` only for sprites, detected per-vertex by `|f16| > 1.0`)
-- Stride 28: stride-20 layout + 8 extra bytes (skipped)
+- Stride 28: position + normal + unknown fields + UV as f16 pair at `+0x18/+0x1A`. The i16 pair at `+0x10/+0x12` and f16 pair at `+0x14/+0x16` are not UV (blend weights / lightmap / sentinel data).
 - Stride 32: skinned characters - position + bone weights (u8x4/255) + bone indices + unknown + UV (f16)
 - Stride 48: particle / billboard positions, no index buffer, 12-byte footer
 
@@ -212,6 +214,10 @@ Skeleton bone table. Each entry is 64 bytes: name (16 bytes), flags (u16), paren
 ### NMTR Chunks
 
 Material definitions, 96 bytes per entry. `w[5]==1` at the first 8xu16 block indicates a diffuse texture; the NTX3 index is at `w[2]`. Alpha texture index is an i16 at `+0x30` (-1 = none).
+
+### NLIT Chunks
+
+Scene lighting data. Contains ambient colour (RGB bytes) and a directional light colour and direction. Parsed into `LightData` and forwarded to the viewport via `SetSceneLighting`. The viewer reconstructs the light direction from interactive pitch/yaw sliders rather than the raw direction field.
 
 ### CSF Chunks
 
@@ -279,6 +285,10 @@ The NMDLLoader scans all sub-chunks within the NMDL size boundary, uploads each 
 ### Skeleton Rendering
 
 NBN2 bones are rendered in two passes: yellow `GL_LINES` from parent to child (depth-tested against the mesh) and white `GL_POINTS` at each joint position (depth-test disabled, always visible on top). Bone world positions are uploaded once at load time. PS3 uses Y-down coordinates; the Flip Y toggle negates the Y component so the skeleton appears upright in the OpenGL viewport.
+
+### Scene Lighting
+
+NLIT chunk data is forwarded to `Viewport3D::SetSceneLighting` when a map is loaded. The viewport stores ambient and directional colours as `glm::vec3` in [0,1] range. The directional light vector is rebuilt each frame from the pitch and yaw slider values, allowing interactive adjustment independent of what the game stored. Lighting is applied in the fragment shader as `ambient * colour + directional * colour * max(dot(N, L), 0)`. Unlit mode bypasses the lighting term entirely and outputs texture colour directly.
 
 ### Text Encoding
 

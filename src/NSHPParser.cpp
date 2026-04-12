@@ -86,33 +86,29 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
             v.normal[0] = DecodeNormal10_10_10(packed, 0);
             v.normal[1] = DecodeNormal10_10_10(packed, 1);
             v.normal[2] = DecodeNormal10_10_10(packed, 2);
-            // UV encoding differs by stride:
-            // stride=24: the f16 pair at +0x14 are the actual UV coordinates.
-            //             The i16 pair at +0x10 is an atlas tile selector (same value
-            //             for all 4 verts of one quad — used by the PS3 shader).
-            // stride=28: the i16 pair at +0x10 /32767 are the UV coordinates.
-            //             The bytes at +0x14..+0x1B encode lightmap/secondary UV.
-            // stride=20/48: use i16 at +0x10 (same as stride=28).
-            // Stride-24: UV = f16 at +0x14/+0x16 (always).
-            // The i16 at +0x10/+0x12 is NOT a UV component — it encodes
-            // terrain blend weights or similar per-vertex data.
-            // Stride-28/20: UV = i16/32767 at +0x10.
-            // stride=24: two UV encoding modes depending on how f16 is used.
-            //
-            // TILING TERRAIN (|f16| > 1):  UV = i16/32767 + f16
-            //   f16 holds large tiling offsets (-10..10). Without i16, the integer
-            //   parts collapse to 0 after GL_REPEAT, making the terrain flat.
-            //   i16 provides the sub-pixel fractional part for proper 2D coverage.
-            //
-            // SPRITE / PROP (|f16| <= 1):  UV = f16 only
-            //   f16 holds the actual 0..1 corner positions of the sprite/quad.
-            //   i16 may vary across vertices (0..1 atlas selector); adding it to f16
-            //   pushes the combined UV over 1.0, causing a visible wrap seam.
+            // UV encoding by stride:
+            // stride=24: UV = f16 pair at +0x14/+0x16 (always).
+            //             i16 at +0x10/+0x12 is an atlas tile selector, not UV.
+            //   TILING TERRAIN (|f16| > 1):  UV = i16/32767 + f16
+            //   SPRITE / PROP  (|f16| <= 1): UV = f16 only
+            // stride=28: UV = f16 pair at +0x18/+0x1A (last 4 bytes of vertex).
+            //             i16 at +0x10/+0x12 = unknown (blend weights / lightmap).
+            //             f16 at +0x14/+0x16 = mostly sentinel 0x5555/0x55FF, not UV.
+            //             UV range is typically [-1..14], tiling freely with GL_REPEAT.
+            // stride=20/48: UV = i16/32767 at +0x10/+0x12.
             if (stride == 24) {
                 // Stride-24: UV is always the f16 pair at +0x14/+0x16.
                 // The i16 at +0x10/+0x12 is not a UV component.
                 v.uv[0] = HalfToFloat(ReadU16BE(vd + 0x14));
                 v.uv[1] = HalfToFloat(ReadU16BE(vd + 0x16));
+            }
+            else if (stride == 28) {
+                // Stride-28 terrain: UV is stored as two f16 values at +0x18/+0x1A.
+                // The i16 pair at +0x10/+0x12 and f16 pair at +0x14/+0x16 are NOT UV
+                // (likely blend weights / lightmap data).
+                // +0x18/+0x1A f16 range is typically [-1..14], tiling with GL_REPEAT.
+                v.uv[0] = HalfToFloat(ReadU16BE(vd + 0x18));
+                v.uv[1] = HalfToFloat(ReadU16BE(vd + 0x1A));
             }
             else {
                 v.uv[0] = ReadI16BE(vd + 0x10) / 32767.f;
@@ -174,6 +170,7 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
         cursor += raw_counts[s];
         out.faceSections.push_back(fs);
     }
+
     return true;
 }
 
