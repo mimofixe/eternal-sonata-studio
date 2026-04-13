@@ -37,6 +37,8 @@ struct NSHPMesh {
     bool     has_bones = false;
     bool     has_skinning = false;
     bool     draw_sequential = false;
+    bool     needs_depth_offset = false;  // NSHP +0x18 bit 0x0004: overlay mesh, needs glPolygonOffset
+    bool     has_vertex_alpha = false;  // bone_weights[0] repurposed as per-vertex alpha for non-skinned
 
     // Backward-compatible fields
     uint8_t  texture_id = 0;

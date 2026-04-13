@@ -87,10 +87,11 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
             v.normal[1] = DecodeNormal10_10_10(packed, 1);
             v.normal[2] = DecodeNormal10_10_10(packed, 2);
             // UV encoding by stride:
-            // stride=24: UV = f16 pair at +0x14/+0x16 (always).
-            //             i16 at +0x10/+0x12 is an atlas tile selector, not UV.
-            //   TILING TERRAIN (|f16| > 1):  UV = i16/32767 + f16
-            //   SPRITE / PROP  (|f16| <= 1): UV = f16 only
+            // stride=24: UV = f16 pair at +0x14/+0x16 (always, for all file types).
+            //             i16 at +0x10/+0x12 is NOT UV — it contains other per-vertex
+            //             data (atlas selectors, blend weights, etc.). Adding i16/32767
+            //             to the f16 UV causes noisy/distorted textures on .bop terrain
+            //             because i16 is random garbage relative to the UV coordinate.
             // stride=28: UV = f16 pair at +0x18/+0x1A (last 4 bytes of vertex).
             //             i16 at +0x10/+0x12 = unknown (blend weights / lightmap).
             //             f16 at +0x14/+0x16 = mostly sentinel 0x5555/0x55FF, not UV.
@@ -114,6 +115,17 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
                 v.uv[0] = ReadI16BE(vd + 0x10) / 32767.f;
                 v.uv[1] = ReadI16BE(vd + 0x12) / 32767.f;
             }
+        }
+        // Repurpose bone_weights[0] as per-vertex alpha for stride-24 non-skinned meshes.
+        // Byte +0x13 is the RGBA alpha (0=transparent, 255=opaque).
+        // IMPORTANT: only valid for stride >= 24. stride-16 is 16 bytes and stride-20 is
+        // 20 bytes — reading vd[0x13] (byte 19) would be out-of-bounds for those.
+        // For all other cases set 1.0 (fully opaque) so the two-pass render is not triggered.
+        if (!skinned && stride >= 24) {
+            v.bone_weights[0] = vd[0x13] / 255.0f;
+        }
+        else if (!skinned) {
+            v.bone_weights[0] = 1.0f;
         }
         out.vertices.push_back(v);
     }
@@ -171,6 +183,22 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
         out.faceSections.push_back(fs);
     }
 
+
+    // Vertex alpha is only valid when ALL values of byte +0x13 are strictly
+    // binary (0 or 255). In .e map meshes the same byte encodes UV data with
+    // arbitrary values — treating those as alpha corrupts texture mapping.
+    if (stride != 32) {
+        out.has_vertex_alpha = false;
+        bool any_transparent = false;
+        bool only_binary = true;
+        for (const auto& v : out.vertices) {
+            const float a = v.bone_weights[0];
+            if (a < 0.99f) any_transparent = true;
+            if (a > 0.001f && a < 0.99f) { only_binary = false; break; }
+        }
+        out.has_vertex_alpha = any_transparent && only_binary;
+    }
+
     return true;
 }
 
@@ -206,6 +234,9 @@ bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
     const uint8_t bone_count = data[0x20];
     out.has_bones = (bone_count > 0);
     out.has_skinning = out.has_bones;
+    // Bit 0x0004 of the u16 at +0x18 marks overlay meshes (ground decals, grass, props
+    // placed on top of base terrain). These need glPolygonOffset to prevent Z-fighting.
+    out.needs_depth_offset = (ReadU16BE(data + 0x18) & 0x0004) != 0;
     size_t off = 0x38;
     out.boneIDList.clear();
     for (uint8_t b = 0; b < bone_count; b++) {

@@ -17,6 +17,9 @@ struct MeshGPUData {
     std::vector<FaceSection> sections;   // per-section draw calls
     size_t vertex_count = 0;
     bool   draw_sequential = false;
+    bool   needs_depth_offset = false;
+    bool   has_vertex_alpha = false;
+
 };
 
 class Viewport3D {

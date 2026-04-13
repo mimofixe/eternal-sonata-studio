@@ -10,27 +10,32 @@
 
 static const char* MESH_VERT = R"(
 #version 450 core
-layout(location=0) in vec3 aPos;
-layout(location=1) in vec3 aNormal;
-layout(location=2) in vec2 aUV;
-out vec3 FragPos;
-out vec3 Normal;
-out vec2 TexCoord;
+layout(location=0) in vec3  aPos;
+layout(location=1) in vec3  aNormal;
+layout(location=2) in vec2  aUV;
+layout(location=3) in float aBoneAlpha;
+out vec3  FragPos;
+out vec3  Normal;
+out vec2  TexCoord;
+out float v_Alpha;
 uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
+uniform int  u_UseVertexAlpha;
 void main(){
     FragPos    = vec3(model * vec4(aPos, 1.0));
     Normal     = mat3(transpose(inverse(model))) * aNormal;
     TexCoord   = aUV;
+    v_Alpha    = (u_UseVertexAlpha != 0) ? aBoneAlpha : 1.0;
     gl_Position = projection * view * vec4(FragPos, 1.0);
 })";
 
 static const char* MESH_FRAG = R"(
 #version 450 core
-in  vec3 FragPos;
-in  vec3 Normal;
-in  vec2 TexCoord;
+in  vec3  FragPos;
+in  vec3  Normal;
+in  vec2  TexCoord;
+in  float v_Alpha;
 out vec4 FragColor;
 uniform vec3      lightPos;
 uniform vec3      viewPos;
@@ -48,19 +53,15 @@ void main(){
     vec4 texSample = vec4(1.0);
     if (u_UseTexture != 0) {
         texSample = texture(u_Diffuse, TexCoord);
-        // Alpha test — threshold depends on texture format:
-        //   DXT1 punch-through: 0.5 (binary: 0 or 1)
-        //   DXT5 full alpha:    0.01 (discard only near-fully-transparent pixels)
         if (texSample.a < u_AlphaThreshold) discard;
     }
-    // Separate greyscale alpha mask texture (e.g. flowers on coloured background)
     if (u_HasAlphaMask != 0) {
         float mask = texture(u_AlphaMask, TexCoord).r;
         if (mask < 0.5) discard;
     }
 
     vec3 baseColor = (u_UseTexture != 0) ? texSample.rgb : objectColor;
-    float outAlpha = (u_UseTexture != 0) ? texSample.a : 1.0;
+    float outAlpha = ((u_UseTexture != 0) ? texSample.a : 1.0) * v_Alpha;
 
     if (u_EnableLighting != 0) {
         vec3 N = normalize(Normal);
@@ -135,6 +136,11 @@ void Viewport3D::UploadMeshToGPU(const NSHPMesh& mesh, MeshGPUData& out) {
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
         (void*)offsetof(Vertex, uv));
     glEnableVertexAttribArray(2);
+    // Attrib 3: bone_weights[0], repurposed as per-vertex alpha for overlay meshes.
+    // Written in NSHPParser::DecodeVertices as vd[0x13]/255.0 for stride >= 24.
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+        (void*)offsetof(Vertex, bone_weights));
+    glEnableVertexAttribArray(3);
 
     if (!mesh.indices.empty()) {
         glGenBuffers(1, &out.EBO);
@@ -148,6 +154,8 @@ void Viewport3D::UploadMeshToGPU(const NSHPMesh& mesh, MeshGPUData& out) {
     out.vertex_count = mesh.vertices.size();
     out.sections = mesh.faceSections;
     out.draw_sequential = mesh.draw_sequential;
+    out.needs_depth_offset = mesh.needs_depth_offset;
+    out.has_vertex_alpha = mesh.has_vertex_alpha;
 }
 
 //  Single mesh 
@@ -174,7 +182,9 @@ void Viewport3D::LoadMesh(const NSHPMesh& mesh) {
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
         (void*)offsetof(Vertex, uv));
     glEnableVertexAttribArray(2);
-
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+        (void*)offsetof(Vertex, bone_weights));
+    glEnableVertexAttribArray(3);
     if (!mesh.indices.empty()) {
         glGenBuffers(1, &m_EBO);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_EBO);
@@ -453,6 +463,8 @@ void Viewport3D::Render() {
         m_MeshShader->SetInt("u_HasAlphaMask", 0);
         m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
 
+        m_MeshShader->SetInt("u_UseVertexAlpha", 0);
+
         // Scene lighting uniforms
         m_MeshShader->SetInt("u_EnableLighting", m_EnableLighting ? 1 : 0);
         {
@@ -466,71 +478,93 @@ void Viewport3D::Render() {
             m_MeshShader->SetVec3("u_DirLightColor", m_DirLightColor);
         }
 
-        for (const auto& gpu : m_ModelMeshes) {
-            if (!gpu.VAO) continue;
-            glBindVertexArray(gpu.VAO);
+        for (int _pass = 0; _pass < 2; ++_pass) {
+            for (const auto& gpu : m_ModelMeshes) {
+                if (!gpu.VAO) continue;
+                if (_pass == 0 && gpu.has_vertex_alpha) continue;
+                if (_pass == 1 && !gpu.has_vertex_alpha) continue;
+                glBindVertexArray(gpu.VAO);
+                if (gpu.has_vertex_alpha) {
+                    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glDepthMask(GL_FALSE);
+                    m_MeshShader->SetInt("u_UseVertexAlpha", 1);
+                }
+                else { m_MeshShader->SetInt("u_UseVertexAlpha", 0); }
 
-            if (gpu.draw_sequential) {
-                m_MeshShader->SetInt("u_UseTexture", 0);
-                glEnable(GL_PROGRAM_POINT_SIZE);
-                glPointSize(4.0f);
-                glDrawArrays(GL_POINTS, 0, (GLsizei)gpu.vertex_count);
+                if (gpu.needs_depth_offset) {
+                    glEnable(GL_POLYGON_OFFSET_FILL);
+                    glPolygonOffset(-1.0f, -1.0f);
+                }
+                if (gpu.draw_sequential) {
+                    m_MeshShader->SetInt("u_UseTexture", 0);
+                    glEnable(GL_PROGRAM_POINT_SIZE);
+                    glPointSize(4.0f);
+                    glDrawArrays(GL_POINTS, 0, (GLsizei)gpu.vertex_count);
 
-            }
-            else if (gpu.sections.empty()) {
-                m_MeshShader->SetInt("u_UseTexture", 0);
-                glDrawElements(GL_TRIANGLES, 0, GL_UNSIGNED_SHORT, nullptr);
+                }
+                else if (gpu.sections.empty()) {
+                    m_MeshShader->SetInt("u_UseTexture", 0);
+                    glDrawElements(GL_TRIANGLES, 0, GL_UNSIGNED_SHORT, nullptr);
 
-            }
-            else {
-                for (const auto& sec : gpu.sections) {
-                    if (sec.index_count == 0) continue;
-                    auto it = m_MatToTex.find(sec.mat_id);
-                    if (it != m_MatToTex.end() && it->second != 0) {
-                        glActiveTexture(GL_TEXTURE0);
-                        glBindTexture(GL_TEXTURE_2D, it->second);
-                        GLenum wrap = m_MatClampIds.count(sec.mat_id)
-                            ? GL_CLAMP_TO_EDGE : GL_REPEAT;
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
-                        m_MeshShader->SetInt("u_UseTexture", 1);
-                        // DXT5: full 8-bit alpha → GL_BLEND + low discard threshold.
-                        // DXT1: binary punch-through → no blend, threshold=0.5.
-                        if (m_MatBlendIds.count(sec.mat_id)) {
-                            glEnable(GL_BLEND);
-                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                            glDepthMask(GL_FALSE);  // transparent: don't occlude geometry behind
-                            m_MeshShader->SetFloat("u_AlphaThreshold", 0.01f);
+                }
+                else {
+                    for (const auto& sec : gpu.sections) {
+                        if (sec.index_count == 0) continue;
+                        auto it = m_MatToTex.find(sec.mat_id);
+                        if (it != m_MatToTex.end() && it->second != 0) {
+                            glActiveTexture(GL_TEXTURE0);
+                            glBindTexture(GL_TEXTURE_2D, it->second);
+                            GLenum wrap = m_MatClampIds.count(sec.mat_id)
+                                ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+                            m_MeshShader->SetInt("u_UseTexture", 1);
+                            // DXT5: full 8-bit alpha → GL_BLEND + low discard threshold.
+                            // DXT1: binary punch-through → no blend, threshold=0.5.
+                            // Exception: if this mesh uses vertex-alpha blending, never
+                            // disable GL_BLEND here — the mesh-level state owns it.
+                            if (m_MatBlendIds.count(sec.mat_id)) {
+                                glEnable(GL_BLEND);
+                                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                                glDepthMask(GL_FALSE);
+                                m_MeshShader->SetFloat("u_AlphaThreshold", 0.01f);
+                            }
+                            else {
+                                if (!gpu.has_vertex_alpha) {
+                                    glDisable(GL_BLEND);
+                                    glDepthMask(GL_TRUE);
+                                }
+                                m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
+                            }
                         }
                         else {
-                            glDisable(GL_BLEND);
-                            glDepthMask(GL_TRUE);
+                            m_MeshShader->SetInt("u_UseTexture", 0);
+                            if (!gpu.has_vertex_alpha) glDisable(GL_BLEND);
                             m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
                         }
+                        auto ita = m_MatToAlpha.find(sec.mat_id);
+                        if (ita != m_MatToAlpha.end() && ita->second != 0) {
+                            glActiveTexture(GL_TEXTURE1);
+                            glBindTexture(GL_TEXTURE_2D, ita->second);
+                            m_MeshShader->SetInt("u_AlphaMask", 1);
+                            m_MeshShader->SetInt("u_HasAlphaMask", 1);
+                        }
+                        else {
+                            m_MeshShader->SetInt("u_HasAlphaMask", 0);
+                        }
+                        glDrawElements(GL_TRIANGLES,
+                            (GLsizei)sec.index_count,
+                            GL_UNSIGNED_SHORT,
+                            (void*)(uintptr_t)(sec.index_start * sizeof(uint16_t)));
                     }
-                    else {
-                        m_MeshShader->SetInt("u_UseTexture", 0);
-                        glDisable(GL_BLEND);
-                        m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
-                    }
-                    auto ita = m_MatToAlpha.find(sec.mat_id);
-                    if (ita != m_MatToAlpha.end() && ita->second != 0) {
-                        glActiveTexture(GL_TEXTURE1);
-                        glBindTexture(GL_TEXTURE_2D, ita->second);
-                        m_MeshShader->SetInt("u_AlphaMask", 1);
-                        m_MeshShader->SetInt("u_HasAlphaMask", 1);
-                    }
-                    else {
-                        m_MeshShader->SetInt("u_HasAlphaMask", 0);
-                    }
-                    glDrawElements(GL_TRIANGLES,
-                        (GLsizei)sec.index_count,
-                        GL_UNSIGNED_SHORT,
-                        (void*)(uintptr_t)(sec.index_start * sizeof(uint16_t)));
                 }
+                glBindVertexArray(0);
+                if (gpu.needs_depth_offset) {
+                    glDisable(GL_POLYGON_OFFSET_FILL);
+                }
+                if (gpu.has_vertex_alpha) { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
             }
-            glBindVertexArray(0);
-        }
+        } // two-pass
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, 0);
         glActiveTexture(GL_TEXTURE0);
@@ -610,9 +644,9 @@ void Viewport3D::CleanupMeshGL() {
 
 void Viewport3D::CleanupModelGL() {
     for (auto& gpu : m_ModelMeshes) {
-        if (gpu.EBO) glDeleteBuffers(1, &gpu.EBO);
-        if (gpu.VBO) glDeleteBuffers(1, &gpu.VBO);
-        if (gpu.VAO) glDeleteVertexArrays(1, &gpu.VAO);
+        if (gpu.EBO)       glDeleteBuffers(1, &gpu.EBO);
+        if (gpu.VBO)       glDeleteBuffers(1, &gpu.VBO);
+        if (gpu.VAO)       glDeleteVertexArrays(1, &gpu.VAO);
     }
     m_ModelMeshes.clear();
     for (GLuint t : m_ModelTextures) if (t) glDeleteTextures(1, &t);
