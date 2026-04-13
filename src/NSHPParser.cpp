@@ -184,19 +184,17 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
     }
 
 
-    // Vertex alpha is only valid when ALL values of byte +0x13 are strictly
-    // binary (0 or 255). In .e map meshes the same byte encodes UV data with
-    // arbitrary values — treating those as alpha corrupts texture mapping.
-    if (stride != 32) {
+    // Vertex alpha (byte +0x13) is only meaningful for stride-24 non-skinned meshes
+    // that also have the needs_depth_offset flag (NSHP +0x18 bit 0x0004).
+    // That flag marks genuine overlay/blend geometry in both .bop and .e files.
+    // Without it, byte +0x13 is UV data (arbitrary values) and must be ignored.
+    // This replaces the old binary-only heuristic which incorrectly rejected
+    // smooth-alpha overlays with intermediate values (e.g. agg90.bop).
+    if (stride == 24 && out.needs_depth_offset) {
         out.has_vertex_alpha = false;
-        bool any_transparent = false;
-        bool only_binary = true;
         for (const auto& v : out.vertices) {
-            const float a = v.bone_weights[0];
-            if (a < 0.99f) any_transparent = true;
-            if (a > 0.001f && a < 0.99f) { only_binary = false; break; }
+            if (v.bone_weights[0] < 0.99f) { out.has_vertex_alpha = true; break; }
         }
-        out.has_vertex_alpha = any_transparent && only_binary;
     }
 
     return true;
