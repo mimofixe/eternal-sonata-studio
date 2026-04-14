@@ -6,11 +6,11 @@
 #include <string>
 
 struct NTX3Texture {
-    uint8_t id = 0;
-    size_t offset = 0;
-    int width = 0;
-    int height = 0;
-    uint8_t format = 0;
+    uint8_t  id = 0;
+    size_t   offset = 0;
+    int      width = 0;
+    int      height = 0;
+    uint8_t  format = 0;    // 0x86=DXT1, else=DXT5, 0xFF=raw RGBA8 (EP3 pre-decoded)
     std::vector<uint8_t> data;
 };
 
@@ -20,6 +20,7 @@ public:
     ~EFileTextureViewer();
 
     void LoadFromFile(const std::vector<Chunk>& chunks, const std::vector<uint8_t>& file_data);
+    void LoadFromEp3(const std::string& path);  // EP3 demo UI textures
     void Clear();
     void Render();
 

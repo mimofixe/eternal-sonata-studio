@@ -65,6 +65,7 @@ add_executable(es_studio
     src/Tutorialviewer.cpp
     src/Nbn2parser.cpp
     src/NMDLLoader.cpp
+    src/Ep3Parser.cpp
 )
 
 target_link_libraries(es_studio PRIVATE

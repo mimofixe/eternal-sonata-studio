@@ -164,7 +164,7 @@ void Application::Run() {
         tex_viewer.Render();
         ImGui::End();
 
-        ImGui::Begin("File Textures (.e / .bop / .bmd / .p3obj)");
+        ImGui::Begin("File Textures (.e / .bop / .bmd / .p3obj / .ep3)");
         efile_tex_viewer.Render();
         ImGui::End();
 
@@ -280,6 +280,9 @@ void Application::Run() {
                         efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
                         text_extractor.LoadFromFile(current_file_data);
                     }
+                }
+                else if (extension == ".ep3") {
+                    efile_tex_viewer.LoadFromEp3(current_file_path);
                 }
                 else if (extension == ".tex") {
                     auto tex = TEXParser::Parse(current_file_path);

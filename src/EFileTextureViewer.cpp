@@ -1,4 +1,5 @@
 #include "EFileTextureViewer.h"
+#include "Ep3Parser.h"
 #include "P3TexParser.h"
 #include "Ntx3parser.h"
 #include "FileDialog.h"
@@ -34,6 +35,31 @@ void EFileTextureViewer::Clear() {
 void EFileTextureViewer::LoadFromFile(const std::vector<Chunk>& chunks, const std::vector<uint8_t>& file_data) {
     Clear();
     ExtractTextures(chunks, file_data);
+}
+
+void EFileTextureViewer::LoadFromEp3(const std::string& path) {
+    Clear();
+    Ep3File ep3;
+    if (!Ep3Parser::Load(path, ep3)) return;
+
+    uint8_t id = 0;
+    for (size_t i = 0; i < ep3.frames.size(); i++) {
+        const Ep3Frame& fr = ep3.frames[i];
+        // Pre-decode to RGBA8 here so GeneratePreview never touches EP3-specific
+        // swizzle logic. format=0xFF signals "raw RGBA8, upload directly".
+        std::vector<uint8_t> rgba;
+        if (!Ep3Parser::DecompressFrame(ep3, i, rgba)) continue;
+
+        NTX3Texture tex;
+        tex.id = id++;
+        tex.offset = fr.pixel_offset;
+        tex.width = fr.width;
+        tex.height = fr.height;
+        tex.format = 0xFF;   // raw RGBA8 — skip DXT decode in GeneratePreview
+        tex.data = std::move(rgba);
+        m_Textures.push_back(std::move(tex));
+    }
+    std::cout << "[EP3] Loaded " << m_Textures.size() << " frame(s) from " << path << "\n";
 }
 
 void EFileTextureViewer::ExtractTextures(const std::vector<Chunk>& chunks, const std::vector<uint8_t>& file_data) {
@@ -322,7 +348,10 @@ void EFileTextureViewer::GeneratePreview(size_t textureIdx) {
     }
 
     std::vector<uint8_t> rgba;
-    if ((tex.format & 0xDF) == 0x86) {
+    if (tex.format == 0xFF) {
+        rgba = tex.data;   // EP3: already decoded to RGBA8 in LoadFromEp3
+    }
+    else if ((tex.format & 0xDF) == 0x86) {
         rgba = P3TexParser::DecompressDXT1(tex.data.data(), tex.width, tex.height);
     }
     else {
@@ -375,7 +404,10 @@ void EFileTextureViewer::ExportTexturePNG(size_t textureIdx) {
 
     // Decompress texture
     std::vector<uint8_t> rgba;
-    if ((tex.format & 0xDF) == 0x86) {
+    if (tex.format == 0xFF) {
+        rgba = tex.data;   // EP3: already RGBA8
+    }
+    else if ((tex.format & 0xDF) == 0x86) {
         rgba = P3TexParser::DecompressDXT1(tex.data.data(), tex.width, tex.height);
     }
     else {
