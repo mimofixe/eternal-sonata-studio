@@ -21,6 +21,7 @@
 #include "Viewport3D.h"
 #include "P3TexViewer.h"
 #include "EFileTextureViewer.h"
+#include "Ep3Parser.h"
 #include "EFileTextExtractor.h" 
 #include "CSFViewer.h"
 
@@ -282,7 +283,26 @@ void Application::Run() {
                     }
                 }
                 else if (extension == ".ep3") {
-                    efile_tex_viewer.LoadFromEp3(current_file_path);
+                    Ep3File ep3_tmp;
+                    if (Ep3Parser::Load(current_file_path, ep3_tmp)) {
+                        current_file_data = ep3_tmp.raw; // copy for chunk inspector
+
+                        // Build chunk list so the Chunks window shows EP3 frames.
+                        loaded_chunks.clear();
+                        for (size_t fi = 0; fi < ep3_tmp.frames.size(); fi++) {
+                            const Ep3Frame& fr = ep3_tmp.frames[fi];
+                            Chunk c;
+                            c.magic = 0x3358544E; // "NTX3"
+                            c.size = static_cast<uint32_t>(fr.pixel_size + 0x80);
+                            c.offset = fr.pixel_offset - 0x80;
+                            c.type = ChunkType::NTX3;
+                            snprintf(c.name, sizeof(c.name), "frame%zu_%dx%d%s",
+                                fi, fr.width, fr.height,
+                                fr.swizzled ? "_swz" : "");
+                            loaded_chunks.push_back(c);
+                        }
+                        efile_tex_viewer.LoadFromEp3(current_file_path);
+                    }
                 }
                 else if (extension == ".tex") {
                     auto tex = TEXParser::Parse(current_file_path);
