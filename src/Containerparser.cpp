@@ -125,7 +125,8 @@ bool ContainerParser::ParseSection(const uint8_t* data, size_t offset,
 
     if (strcmp(magic, "Mefc") == 0) {
         out.type = "mefc";
-        return ParseMefcContainer(data, offset, sec_size, out);
+        // FIX: pass file_size so ParseMefcContainer can recurse into NOBJ
+        return ParseMefcContainer(data, offset, sec_size, file_size, out);
     }
 
     if (strcmp(magic, "NOBJ") == 0) {
@@ -157,8 +158,10 @@ bool ContainerParser::ParseSection(const uint8_t* data, size_t offset,
     return true;
 }
 
+// FIX: added file_size parameter so NOBJ chunks inside Mefc can be recursed into,
+// exposing NMDL and NSHP just like EFileParser does for .e files.
 bool ContainerParser::ParseMefcContainer(const uint8_t* data, size_t offset,
-    size_t mefc_size, ContainerSection& out) {
+    size_t mefc_size, size_t file_size, ContainerSection& out) {
     const uint8_t* mefc_data = data + offset;
 
     char name_buffer[64];
@@ -174,6 +177,14 @@ bool ContainerParser::ParseMefcContainer(const uint8_t* data, size_t offset,
             uint32_t chunk_size = ReadU32BE(mefc_data + i + 4);
 
             if (chunk_size > 0 && i + chunk_size <= mefc_size) {
+                // FIX: NOBJ containers are recursed into so that nested NMDL and
+                // NSHP chunks appear in the list, matching .e / .p3obj behaviour.
+                if (type == ChunkType::NOBJ) {
+                    ParseNOBJContainer(data, offset + i, chunk_size, file_size, out);
+                    i += chunk_size;
+                    continue;
+                }
+
                 Chunk chunk;
                 chunk.offset = offset + i;
                 chunk.size = chunk_size;

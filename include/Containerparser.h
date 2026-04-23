@@ -68,7 +68,7 @@ private:
         size_t file_size, ContainerSection& out);
 
     static bool ParseMefcContainer(const uint8_t* data, size_t offset,
-        size_t mefc_size, ContainerSection& out);
+        size_t mefc_size, size_t file_size, ContainerSection& out);
 
     static void ParseNOBJContainer(const uint8_t* data, size_t offset,
         size_t nobj_size, size_t file_size,
