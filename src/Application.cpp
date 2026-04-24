@@ -231,6 +231,7 @@ void Application::Run() {
 
                         efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
                         text_extractor.LoadFromFile(current_file_data);
+                        csf_viewer.SetFileContext(current_file_data, loaded_chunks); // NEW
 
                         if (container.has_csf) {
                             csf_viewer.LoadFile(current_file_path);
@@ -280,6 +281,7 @@ void Application::Run() {
 
                         efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
                         text_extractor.LoadFromFile(current_file_data);
+                        csf_viewer.SetFileContext(current_file_data, loaded_chunks); // NEW
                     }
                 }
                 else if (extension == ".ep3") {
@@ -322,6 +324,7 @@ void Application::Run() {
 
                         selected_chunk_idx = -1;
                         efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
+                        csf_viewer.SetFileContext(current_file_data, loaded_chunks); // NEW
                     }
                 }
             }

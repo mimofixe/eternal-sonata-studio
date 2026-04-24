@@ -76,10 +76,13 @@ std::vector<Chunk> EFileParser::Parse(const std::string& filepath) {
     std::cout << "File: " << filepath << std::endl;
     std::cout << "Size: " << fileSize << " bytes (" << (fileSize / 1024.0f / 1024.0f) << " MB)" << std::endl;
 
+    // FIX: MAGIC_CSF added to scan array (was recognised in GetChunkType but
+    // missing here, so CSF chunks inside .e files were silently skipped)
     const uint32_t magics[] = {
         MAGIC_NOBJ, MAGIC_NMDL, MAGIC_NSHP, MAGIC_NTX3, MAGIC_NMTN,
         MAGIC_NCAM, MAGIC_NLIT, MAGIC_NFOG, MAGIC_NMTR, MAGIC_SONG,
-        MAGIC_NBN2, MAGIC_NMTB, MAGIC_NDYN, MAGIC_NLC2, MAGIC_NCLS
+        MAGIC_NBN2, MAGIC_NMTB, MAGIC_NDYN, MAGIC_NLC2, MAGIC_NCLS,
+        MAGIC_CSF
     };
 
     for (size_t i = 0; i < fileSize - 64; i++) {
@@ -177,6 +180,10 @@ std::vector<Chunk> EFileParser::Parse(const std::string& filepath) {
                 snprintf(chunk.name, sizeof(chunk.name), "audio_%zu", chunks.size());
                 break;
 
+            case ChunkType::CSF:
+                snprintf(chunk.name, sizeof(chunk.name), "csf_%zu", chunks.size());
+                break;
+
             default:
                 strncpy(chunk.name, "[unknown]", sizeof(chunk.name) - 1);
                 break;
@@ -204,6 +211,7 @@ std::vector<Chunk> EFileParser::Parse(const std::string& filepath) {
     std::cout << "  NFOG (fog): " << counts[(int)ChunkType::NFOG] << std::endl;
     std::cout << "  NMTR (materials): " << counts[(int)ChunkType::NMTR] << std::endl;
     std::cout << "  SONG (audio): " << counts[(int)ChunkType::SONG] << std::endl;
+    std::cout << "  CSF (audio):  " << counts[(int)ChunkType::CSF] << std::endl;
     std::cout << "  NMTB/NDYN/NLC2/NCLS: "
         << counts[(int)ChunkType::NMTB] + counts[(int)ChunkType::NDYN]
         + counts[(int)ChunkType::NLC2] + counts[(int)ChunkType::NCLS] << std::endl;
