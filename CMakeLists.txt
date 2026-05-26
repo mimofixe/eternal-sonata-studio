@@ -66,6 +66,10 @@ add_executable(es_studio
     src/Nbn2parser.cpp
     src/NMDLLoader.cpp
     src/Ep3Parser.cpp
+    src/Animviewport.cpp
+    src/Nmtnparser.cpp
+    src/Ntx2parser.cpp
+    src/TcxDecompressor.cpp
 )
 
 target_link_libraries(es_studio PRIVATE

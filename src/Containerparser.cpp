@@ -144,6 +144,29 @@ bool ContainerParser::ParseSection(const uint8_t* data, size_t offset,
         return true;
     }
 
+    // Standalone NTEX section (BMD files)
+    if (strcmp(magic, "NTEX") == 0) {
+        out.type = "chunk";
+        Chunk chunk;
+        chunk.offset = offset;
+        chunk.size = sec_size;
+        chunk.magic = *reinterpret_cast<const uint32_t*>(data + offset);
+        chunk.type = ChunkType::NTEX;
+        // DDS width/height from LE header at NTEX+8+16 / NTEX+8+12
+        if (offset + 8 + 20 <= file_size) {
+            const uint8_t* d = data + offset;
+            uint32_t dds_w = d[24] | (d[25] << 8) | (d[26] << 16) | (d[27] << 24);
+            uint32_t dds_h = d[20] | (d[21] << 8) | (d[22] << 16) | (d[23] << 24);
+            char fourcc[5] = { 0 };
+            if (offset + 92 + 4 <= file_size)
+                memcpy(fourcc, data + offset + 92, 4);
+            snprintf(chunk.name, sizeof(chunk.name), "%ux%u_%s", dds_w, dds_h, fourcc);
+        }
+        if (chunk.name[0] == '\0') strncpy(chunk.name, "NTEX", 63);
+        out.chunk = chunk;
+        return true;
+    }
+
     out.type = "chunk";
 
     Chunk chunk;
@@ -275,6 +298,47 @@ void ContainerParser::ParseNOBJContainer(const uint8_t* data, size_t offset,
             break;
         }
 
+        case ChunkType::NTX2: {
+            // Xbox 360 tiled texture - extract name from TX2D descriptor
+            // Name is at chunk_data + 0x2C (max 32 bytes)
+            int ntx2_n = 0;
+            for (const auto& ch : out.chunks)
+                if (ch.type == ChunkType::NTX2) ntx2_n++;
+            if (i + 0x2C + 4 < nobj_end) {
+                // Try to copy TX2D name
+                size_t j = 0;
+                for (; j < sizeof(chunk.name) - 1 && i + 0x2C + j < nobj_end; j++) {
+                    uint8_t c = data[i + 0x2C + j];
+                    if (c == 0) break;
+                    if (c >= 32 && c < 127) chunk.name[j] = c;
+                    else break;
+                }
+            }
+            if (chunk.name[0] == '\0')
+                snprintf(chunk.name, sizeof(chunk.name), "xbox_tex_%d", ntx2_n);
+            break;
+        }
+
+        case ChunkType::NTEX: {
+            // NTEX wraps a standard DDS file; use the DDS dimensions as the name
+            int ntex_n = 0;
+            for (const auto& ch : out.chunks)
+                if (ch.type == ChunkType::NTEX) ntex_n++;
+            // DDS header (LE) at NTEX+8: width at +16, height at +12
+            if (i + 8 + 20 <= nobj_end) {
+                uint32_t dds_w = (data[i + 24]) | (data[i + 25] << 8) | (data[i + 26] << 16) | (data[i + 27] << 24);
+                uint32_t dds_h = (data[i + 20]) | (data[i + 21] << 8) | (data[i + 22] << 16) | (data[i + 23] << 24);
+                // FourCC at DDS+84 = NTEX+8+84 = NTEX+92
+                char fourcc[5] = { 0 };
+                if (i + 92 + 4 <= nobj_end)
+                    memcpy(fourcc, data + i + 92, 4);
+                snprintf(chunk.name, sizeof(chunk.name), "%ux%u_%s", dds_w, dds_h, fourcc);
+            }
+            if (chunk.name[0] == '\0')
+                snprintf(chunk.name, sizeof(chunk.name), "dds_tex_%d", ntex_n);
+            break;
+        }
+
         case ChunkType::NMTR:
             snprintf(chunk.name, sizeof(chunk.name), "material_%zu", out.chunks.size());
             break;
@@ -308,6 +372,12 @@ void ContainerParser::CollectChunks(const ContainerSection& sec, ContainerFile& 
         if (sec.chunk.type == ChunkType::NTX3) {
             out.ntx3_count++;
         }
+        else if (sec.chunk.type == ChunkType::NTX2) {
+            out.ntx2_count++;
+        }
+        else if (sec.chunk.type == ChunkType::NTEX) {
+            out.ntex_count++;
+        }
         else if (sec.chunk.type == ChunkType::CSF) {
             out.has_csf = true;
         }
@@ -322,6 +392,12 @@ void ContainerParser::CollectChunks(const ContainerSection& sec, ContainerFile& 
 
             if (chunk.type == ChunkType::NTX3) {
                 out.ntx3_count++;
+            }
+            else if (chunk.type == ChunkType::NTX2) {
+                out.ntx2_count++;
+            }
+            else if (chunk.type == ChunkType::NTEX) {
+                out.ntex_count++;
             }
             else if (chunk.type == ChunkType::CSF) {
                 out.has_csf = true;
@@ -417,6 +493,8 @@ uint32_t ContainerParser::ReadU32BE(const uint8_t* data) {
 
 ChunkType ContainerParser::GetChunkTypeFromMagic(uint32_t magic) {
     if (magic == MAGIC_NTX3) return ChunkType::NTX3;
+    if (magic == MAGIC_NTX2) return ChunkType::NTX2;
+    if (magic == MAGIC_NTEX) return ChunkType::NTEX;
     if (magic == MAGIC_NSHP) return ChunkType::NSHP;
     if (magic == MAGIC_NOBJ) return ChunkType::NOBJ;
     if (magic == MAGIC_NMDL) return ChunkType::NMDL;

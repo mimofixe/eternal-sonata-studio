@@ -42,6 +42,8 @@ struct ContainerFile {
     std::vector<Chunk> all_chunks;
 
     int ntx3_count;
+    int ntx2_count;  // Xbox 360 textures
+    int ntex_count;  // Xbox 360 DDS textures
     int mefc_count;
     int chunk_count;
     bool has_csf;
@@ -52,7 +54,7 @@ struct ContainerFile {
         num_sections(0), offset_table_start(0x10),
         table_count(0), has_leading_section(false),
         leading_section_offset(0),
-        ntx3_count(0), mefc_count(0), chunk_count(0),
+        ntx3_count(0), ntx2_count(0), ntex_count(0), mefc_count(0), chunk_count(0),
         has_csf(false), has_font(false) {
     }
 };

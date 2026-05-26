@@ -1,6 +1,6 @@
 # Eternal Sonata Studio
 
-A reverse-engineering toolkit for viewing and extracting assets from Eternal Sonata (PlayStation 3). Xbox 360 support may follow later.
+A reverse-engineering toolkit for viewing and extracting assets from Eternal Sonata (PlayStation 3 + Xbox 360). The toolkit covers PS3 demo, Xbox 360 demo, and Xbox 360 retail builds, including transparent decompression of the proprietary Xbox 360 retail container format.
 
 ## Overview
 
@@ -16,24 +16,43 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 - Parse `.bop` container files
 - Parse `.bmd` and `.camp` container files with full section table support
 - Parse `.tex` texture atlas per language
+- Parse `.ep3` UI animation containers (PS3 demo, Mefc-based frames)
 - NOBJ sub-container parsing - finds all nested chunks (NTX3, NSHP, NMTN, NBN2, etc.) at any depth
 - P3OBJ object data parsing
 - Chunk-based file structure inspection (NSHP, NTX3, NOBJ, NMDL, NMTN, NBN2, NCAM, NLIT, NMTR, NFOG, NMTB, NDYN, NLC2, NCLS, CSF, FONT)
 - Hex viewer for raw binary data analysis
 
+### Xbox 360 Retail Support
+
+Xbox 360 retail files use a proprietary tri-Crescendo (Tcx) compression format. Demo Xbox 360 builds and PS3 builds are uncompressed and pass straight through.
+
+- **Automatic detection** -- the loader checks the first four bytes against the known magic table (BMD, BOP, NOBJ, NTX3, NTX2, Mefc, CSF, AI-script `0x00000181`, etc.). If the file does not match any known magic and has a plausible 256-byte frequency header, it is treated as a Tcx stream.
+- **Transparent decompression** -- compressed files are decoded once and routed through the existing parsers via a temporary working file. The original game file is never modified. A `[Xbox 360 retail - auto-decompressed]` badge appears in the Chunks panel when a decompressed file is being viewed.
+- **Supported extensions** -- `.e`, `.bmd`, `.bop`, and `.x3tex` (Xbox 360 texture archives). The decompressor is also invoked from the dedicated **Load P3TEX / X3TEX** button.
+
 ### Texture Viewing
 
 - NTX3 texture format support (DXT1/DXT5/DXT1+mip/DXT5+mip/RGBA8 compression)
 - Full PS3 DXT5 block-swap decoding (Namco stores colour and alpha sub-blocks in reverse order)
+- NTX2 texture format support (Xbox 360 retail) - parses Namco's wrapper around XPR2 tiled textures, untiles to linear DXT1, then decompresses to RGBA8
 - `.tex` file support
-- P3TEX texture archive browsing with grid and detail viewing modes
+- P3TEX (PS3) and X3TEX (Xbox 360) texture archive browsing with grid and detail viewing modes
 - Texture dimensions: 16x16 to 4096x4096
 - PNG export with proper transparency (0xEE fill regions exported as alpha=0)
-- Works across `.e`, `.bop`, `.bmd`, and `.camp` files
+- Works across `.e`, `.bop`, `.bmd`, `.camp`, `.p3tex`, `.x3tex`, and `.ep3` files
+
+### EP3 UI Animations
+
+`.ep3` files are Mefc-wrapped containers holding sequences of NTX3 frames used for PS3 demo UI screens (controller diagrams, pause-trial atlases, splash screens). The parser walks the Mefc chunk-key table, identifies every embedded NTX3 frame, and builds a chunk list so each frame appears in the Chunks panel.
+
+- Frame-by-frame inspection with width/height per frame
+- Swizzled DXT5 detection (format byte bit `0x20`) and Morton-order block deswizzling
+- Each frame exported individually via the standard texture viewer paths
 
 ### Audio
 
 - CSF audio container parsing - loads from file or directly from memory buffers inside containers
+- **CSF inside `evdata` containers** -- battle and cutscene event archives keep their voice clips as CSF sub-blocks. The parser correctly enumerates them, the Chunks panel groups them by source container, and the CSF Audio Export panel offers per-track or full-archive export with stable suffixes (`<base>_csf<i>_<clip>.at3`).
 - Export individual tracks or all tracks at once to `.at3` (ATRAC3)
 - Playback-ready with foobar2000 + ATRAC plugin or compatible PS3 audio tools
 
@@ -60,7 +79,7 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 
 **DXT5 blend pass** -- materials with DXT5 diffuse textures (full 8-bit alpha) are drawn in a second render pass with `GL_BLEND` enabled and depth writes suppressed. Transparent sprites, leaf overlays, and ground decals composite correctly over opaque geometry.
 
-**Terrain UV** -- stride-24 map meshes use a two-field UV: `UV = i16/32767 + f16`. The f16 field alone collapses to zero after `GL_REPEAT` for integer offset values. The i16 component provides the fractional base for correct texture coverage. Sprite/prop meshes on the same stride use f16 only, detected per-vertex by `|f16| > 1.0`.
+**Terrain UV** -- stride-24 map meshes use a two-field UV: `UV = i16/32767 + f16`. The f16 field alone collapses to zero after `GL_REPEAT` for integer offset values. The i16 component provides the fractional base for correct texture coverage. Sprite/prop meshes on the same stride use f16 only, detected per-vertex by `|f16| > 1.0`. Stride-28 meshes use a separate f16 UV pair at `+0x18/+0x1A`.
 
 **Scene lighting** -- when a map model is loaded, a **Scene Lighting** toggle appears in the viewport toolbar if NLIT data is present. Enabling it switches to an ambient + directional lighting model using colours read from the NLIT chunk. Pitch and Yaw sliders let you adjust the light direction interactively. Lighting is disabled by default; unlit output matches the raw texture colours exactly.
 
@@ -74,6 +93,19 @@ Eternal Sonata Studio provides low-level access to game files, enabling inspecti
 - Camera auto-fits to skeleton bounding box on load
 - "Flip Y" toggle for PS3 Y-down to OpenGL Y-up conversion
 - Bone list in ChunkInspector shows all bones inline with Euler angles, local positions, and type colour-coding (dynamic chains in blue, effectors in green)
+
+### Animation Viewport (work in progress, output is wrong)
+
+`.e` character files contain NBN2 skeletons, NSHP skinned meshes, and NMTN animation tracks. The Animation Viewport ties them together: it locates the skinned NSHP inside the NMDL envelope, builds the inverse-bind matrices, and applies NMTN keyframe deltas on top of the NBN2 bind pose every frame.
+
+UI: animation selector, play/pause, frame slider with frame count display, FPS slider, skeleton overlay toggle. The viewport is offscreen-rendered to an ImGui-embedded texture so it composes inside the docking layout.
+
+**The animation result is currently incorrect.** Two known issues:
+
+1. **Channel routing is a guess.** NMTN tracks store three channels (`c0/c1/c2`). For translation bones the parser maps `c0 -> dx (lateral)`, `c2 -> dy (vertical)` and skips `c1` (root motion forward). For rotation bones it maps `c0 -> ry`, `c1 -> rx`, `c2 -> rz`. These mappings were inferred from a few test files and are wrong for many bones — limbs end up rotating around the wrong axis.
+2. **No bezier tangent handling.** NMTN Format-A tracks include tangent data after each keyframe; the parser drops the tangents and treats keys as linear-interpolated. Smooth ease-in/ease-out motions come out as straight ramps.
+
+The viewport is shipped as-is for debugging the format. Don't use it for asset extraction yet.
 
 ### AI Behaviour Scripts
 
@@ -98,97 +130,45 @@ Viewer tabs: **Overview - Disassembly - Actions - API Calls - Ctrl Flow - String
 - Support for text markers (`<WAIT>`, `\n`)
 - Character name detection
 
-### Scene Data
-
-- Camera parser (position, rotation, FOV)
-- Light parser (type, colour, intensity)
-- Fog and material parsers
-- NMTR material parser (diffuse and alpha NTX3 index per material)
-
 ---
 
-## Build Requirements
+## File Format Reference
 
-### Compiler
+### NTX3 Chunks (PS3)
 
-- C++17 or later
-- CMake 3.15+
-- OpenGL 4.5+
+Texture chunks. Pixel data starts at `chunk_offset + 0x88`. Format byte at `+0x18`:
+- DXT1 (`0x86`): direct decode with `bcdec_bc1`
+- DXT5 (`0x88` / variants): colour sub-block first (bytes 0-7), alpha sub-block second (bytes 8-15) -- halves are swapped before calling `bcdec_bc3`
+- RGBA8 (`0xA5`): header height is `actual_height / 2`; real height = `data_size / (width x 4)`
+- Mipmap flag is bit `0x20`; strip it with `(fmt & 0xDF)` before identifying the base format
 
-### Platforms
+### NTX2 Chunks (Xbox 360)
 
-- Windows: Visual Studio 2019+ or MinGW
-- Linux: GCC 9+ or Clang 10+
-- macOS: Xcode 11+ or Clang 10+
-
-### Dependencies
-
-- GLFW 3.3+ (windowing)
-- GLM 0.9.9+ (mathematics)
-- Dear ImGui 1.89+ (UI)
-- glad (OpenGL loader)
-- bcdec (DXT decompression)
-
-## Compilation
-
-**Windows (Visual Studio)**
-```
-cmake -B build -G "Visual Studio 16 2019"
-cmake --build build --config Release
-```
-
-**Linux / macOS**
-```
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-make -C build
-```
-
-## Usage
+Namco's wrapper around an XPR2 (Xbox Packed Resource v2) tiled texture. Layout:
 
 ```
-./build/es_studio
++0x00  "NTX2"          magic
++0x04  chunk_size      total size of this NTX2 entry (u32 BE)
++0x08  "XPR2"          sub-magic
++0x0C  xpr2_tail_size  size of the trailing pad region (u32 BE)
++0x10  hdr_sz          offset where pixel data ends / tail begins (u32 BE)
++0x14  1               num_textures, always 1 (u32 BE)
++0x18  "TX2D"          descriptor magic
++0x1C  tx2d_name_sz    size of the name-area block (0x20 or 0x30)
++0x2C  <name>          null-terminated ASCII filename
+       <GPUTEXTURE_FETCH_CONSTANT>  6 x u32 BE  (Xenos texture descriptor)
+       width  = (W2 & 0x1FFF) + 1
+       height = ((W2 >> 13) & 0x1FFF) + 1
+       format =  W1 & 0x3F          (18 = DXT1, 20 = DXT5)
 ```
 
----
+Pixel data begins at the first 4 KB-aligned absolute address that is at least `0x1000` past the chunk start. Tiled layout uses the Xenia `XenosTextureTiledAddress2D` mapping, which interleaves a 32x32 macro-tile grid with a bank/pipe/oib hash; the parser implements this exactly so block `(bx, by)` is read from the correct offset.
 
-## File Format Documentation
+DXT1 is fully supported. DXT5 and RGBA8 paths exist but were not exhaustively tested -- if a texture renders garbled, log the format value reported in the parser output.
 
-### `.e` Container Files
+### P3TEX / X3TEX Files
 
-Container format holding multiple chunks. Each chunk has a 4-byte magic identifier (e.g. `NSHP`, `NTX3`), a 4-byte size field, and a variable-length data payload.
-
-### `.e` AI Behaviour Scripts
-
-Compiled behaviour tree scripts with magic `0x00000181`. Distinct from the container format above. Each file is a custom stack-based VM bytecode with up to 600+ nodes. The VM has two memory spaces: a local per-entity frame and a shared world space for cross-entity coordination. The game binary is called via `CALLAPI(address)` with absolute PS3 binary addresses.
-
-### `.e` Tutorial Files
-
-Tutorial voiceover files also use magic `0x00000181` but contain a CSF audio stream and subtitle text chunks rather than VM bytecode. Detected by checking `code_size > 0x100000` at offset `0x14`.
-
-### `.bop` Files
-
-Same chunk structure as `.e` container files. Used for character and object data.
-
-### `.bmd` / `.camp` Files
-
-Higher-level container with a section table. Supported layouts:
-
-- Direct section table at `0x10` (e.g. `appkeep.bmd`)
-- Leading section offset at `0x0C` followed by table at `0x10` (e.g. `characterphoto.bmd`, `camp_char.bmd`)
-- NOBJ sub-containers holding nested model data (e.g. `appkeep2.bmd`)
-
-### NTX3 Chunks
-
-Texture data. The format byte at offset `0x18` determines the compression type. Bit `0x20` indicates a mipmap chain and is masked off before comparing: `(fmt & 0xDF) == 0x86` -> DXT1, `(fmt & 0xDF) == 0x88` -> DXT5, `fmt == 0xA5` -> raw RGBA8.
-
-- Header: 136 bytes (`0x88`). Pixel data starts at `+0x88`.
-- Dimensions: 16-bit big-endian at offsets `0x20` (width) and `0x22` (height)
-- DXT5: colour sub-block first (bytes 0-7), alpha sub-block second (bytes 8-15) -- halves are swapped before calling `bcdec_bc3`
-- RGBA8 (0xA5): header height is `actual_height / 2`; real height = `data_size / (width x 4)`
-
-### P3TEX Files
-
-Archive containing multiple NTX3 textures. Pixel data for each chunk starts at `chunk_offset + 0x88`. DXT5 textures use the PS3 block-swap.
+Archives containing multiple texture chunks. `.p3tex` (PS3) holds NTX3 chunks; `.x3tex` (Xbox 360, optionally Tcx-compressed) holds NTX2 chunks. The same parser handles both transparently and the same viewer renders the result.
 
 ### NSHP Chunks
 
@@ -215,17 +195,25 @@ Skeleton bone table. Each entry is 64 bytes: name (16 bytes), flags (u16), paren
 
 Material definitions, 96 bytes per entry. `w[5]==1` at the first 8xu16 block indicates a diffuse texture; the NTX3 index is at `w[2]`. Alpha texture index is an i16 at `+0x30` (-1 = none).
 
+### NMTN Chunks
+
+Animation tracks. Each animation has a name, a frame count, and a list of per-bone tracks. Two storage formats (A and BC) coexist; both decode into the same `NMTNTrack { is_translation, is_static, rx/ry/rz channels }` runtime structure. The channel routing into Euler XYZ deltas is the part still being verified -- see the Animation Viewport caveats.
+
 ### NLIT Chunks
 
 Scene lighting data. Contains ambient colour (RGB bytes) and a directional light colour and direction. Parsed into `LightData` and forwarded to the viewport via `SetSceneLighting`. The viewer reconstructs the light direction from interactive pitch/yaw sliders rather than the raw direction field.
 
 ### CSF Chunks
 
-Audio container holding ATRAC3 streams. Exportable to `.at3`. Loads from file or directly from a memory buffer inside any container format.
+Audio container holding ATRAC3 streams. Header is `CSF ` + `BOOK` + a sequence of `TIM ` entries describing each clip's sample rate, offset, and length. Exportable to `.at3`. Loads from file or directly from a memory buffer inside any container format, including the `evdata` event-archive `.e` files used during battle dialogue.
 
 ### P3OBJ Files
 
 Object data container, parsed and listed in the file browser.
+
+### EP3 Files
+
+Mefc-wrapped UI animation containers. The Mefc header carries a chunk-key block at `+0x28` describing each component (TEX0 / TRC0 / EFCT). Frames are stored as a sequence of NTX3 blocks, each with its own 128-byte header and a swizzled DXT5 payload. Frame count = number of NTX3 blocks found sequentially in the file.
 
 ---
 
@@ -240,6 +228,10 @@ eternal-sonata-studio/
 │   ├── NBN2Parser.h
 │   ├── NMDLLoader.h
 │   ├── AIScriptParser.h
+│   ├── NTX2Parser.h
+│   ├── TcxDecompressor.h
+│   ├── AnimViewport.h
+│   ├── Ep3Parser.h
 │   └── ...
 ├── src/                # Source files
 │   ├── main.cpp
@@ -253,14 +245,29 @@ eternal-sonata-studio/
 
 ## Known Limitations
 
-- Animation data (NMTN) is parsed and listed but not yet visualised
+- Animation playback is implemented but produces incorrect motion -- channel-to-axis routing and bezier tangent handling still need work
 - Skinned mesh vertex normals are not yet decoded correctly; geometric normals are used as a workaround in the viewer
-- Xbox 360 specific compression not implemented
+- NTX2 DXT5 and RGBA8 paths are present but not exhaustively tested
 - Material export not available
 
 ---
 
 ## Technical Notes
+
+### Xbox 360 Decompression
+
+Xbox 360 retail builds wrap most `.e`, `.bmd`, `.bop`, and `.x3tex` files in a proprietary tri-Crescendo (Tcx) format. The algorithm was reverse-engineered from the Xbox 360 executable -- the relevant functions sit at virtual addresses `0x821189B8` (initialiser), `0x82118AF8` (per-symbol arithmetic decode) and `0x82118C70` (main LZSS decode loop). It is a classic two-layer entropy coder:
+
+1. **Static arithmetic coding.** The first 256 bytes of the file are a frequency table -- one byte per symbol 0..255. The decoder builds cumulative and inverse-lookup tables, initialises `low = 0`, `range = 0xFFFFFFFF`, and reads the next four bytes into `code`. Each symbol is recovered as `inv[(code - low) / (range / total)]`, followed by a low/range update and a double normalisation pass (the main pass shifts when the high byte of `low` matches the high byte of `low + range`; an underflow pass kicks in when `range` drops below `0x2000`).
+2. **LZSS layer.** Output bytes from the arithmetic stream feed a tiny state machine with four modes. Mode 0 captures a control byte (eight 1-bit literal/back-ref flags); mode 1 emits a literal and writes it into a 4 KB sliding dictionary (initial position `0xFEE`); modes 2 and 3 capture the low and high+length bytes of a 12-bit-offset / 4-bit-length-plus-three back-reference and copy from the dictionary.
+
+The decompressor is invoked automatically when a file fails the known-magic check and looks like a Tcx stream (non-trivial frequency sum, at least eight distinct values in the first 256 bytes). Decompressed contents are written to a temp file and the rest of the toolchain operates on that path. For BMD/BOP/CAMP/SCP containers the decompressed size is trimmed to the value at file offset `+0x04` so that container parsers don't trip on a few trailing LZSS overflow bytes.
+
+### NTX2 Texture Decoding (Xbox 360)
+
+Xbox 360 textures live inside NTX2 chunks that wrap an XPR2 descriptor. The parser reads the Xenos `GPUTEXTURE_FETCH_CONSTANT` to recover width, height, format, and pitch -- pitch comes from the W0 pitch field rather than `width_blocks >> 5` so that narrow non-power-of-two textures (whose pitch is padded to 32 blocks) decode correctly.
+
+Pixel data sits at the first 4 KB-aligned address at least `0x1000` past the chunk start. Block addressing follows Xenia's `XenosTextureTiledAddress2D`: each output block `(bx, by)` is read from a tiled offset computed by a bank/pipe/oib hash. The untiler reorders the 8-byte DXT1 blocks into a linear buffer, which is then handed to `bcdec_bc1` for RGBA8 decode. The result is stored in `P3Texture::data` with `format = P3TEX_FORMAT_RGBA8_DECODED (0xFF)` so the viewer skips re-decompression and uploads it straight to GL.
 
 ### Texture Decompression
 
@@ -286,6 +293,12 @@ The NMDLLoader scans all sub-chunks within the NMDL size boundary, uploads each 
 
 NBN2 bones are rendered in two passes: yellow `GL_LINES` from parent to child (depth-tested against the mesh) and white `GL_POINTS` at each joint position (depth-test disabled, always visible on top). Bone world positions are uploaded once at load time. PS3 uses Y-down coordinates; the Flip Y toggle negates the Y component so the skeleton appears upright in the OpenGL viewport.
 
+### Animation Pipeline
+
+The AnimViewport ties NBN2, the skinned NSHP inside the NMDL envelope, and NMTN tracks together. Each frame it copies the bind pose, walks every track's `NMTNChannel::Sample(t)` (linear interpolation between keyframes), adds the resulting deltas into the Euler / position fields of the corresponding bone, then re-runs `NBN2Parser::ComputeWorldPositions` to refresh world matrices. Skinning matrices `world * inv_bind` are uploaded per draw as a `mat4` array uniform; the vertex shader does the standard four-weight blend.
+
+The pose application is correct in *shape*; the part that's wrong is which NMTN channel feeds which bone axis. Format-A tracks also carry bezier tangents that are currently dropped, so smooth easing comes out as a piecewise-linear ramp. Both issues are isolated to `NMTNParser::ParseAnimation` and `AnimViewport::ApplyPose`.
+
 ### Scene Lighting
 
 NLIT chunk data is forwarded to `Viewport3D::SetSceneLighting` when a map is loaded. The viewport stores ambient and directional colours as `glm::vec3` in [0,1] range. The directional light vector is rebuilt each frame from the pitch and yaw slider values, allowing interactive adjustment independent of what the game stored. Lighting is applied in the fragment shader as `ambient * colour + directional * colour * max(dot(N, L), 0)`. Unlit mode bypasses the lighting term entirely and outputs texture colour directly.
@@ -296,7 +309,11 @@ Game text uses ASCII encoding with custom markup tags (`<WAIT>` for pauses, `\n`
 
 ### Audio Export
 
-CSF containers hold ATRAC3 audio data. The exporter strips the CSF framing and writes a standard `.at3` file compatible with PS3 audio tools and foobar2000 with the appropriate plugin. The parser also loads directly from memory buffers, making in-container audio accessible without extraction.
+CSF containers hold ATRAC3 audio data. The exporter strips the CSF framing and writes a standard `.at3` file compatible with PS3 audio tools and foobar2000 with the appropriate plugin. The parser also loads directly from memory buffers, making in-container audio accessible without extraction -- the same path handles standalone `.csf`, CSF blocks inside `.bmd`/`.bop`/`.e` containers, and the per-clip CSF entries inside event archives (`evdata`).
+
+### EP3 Parsing
+
+EP3 files open with a `Mefc` header and a chunk-key block at offset `0x28` that lists the embedded components. The parser scans the file for NTX3 sub-blocks, reads each one's width/height/format from the standard NTX3 fields, and produces an `Ep3Frame` with the absolute pixel offset and size. Frames flagged with format bit `0x20` are swizzled in Morton (Z-order) block order; the deswizzler interleaves the bits of the block coordinates to recover the linear order. Each frame is surfaced as a synthetic NTX3 chunk in the file browser so the existing texture viewer can render and export it.
 
 ---
 

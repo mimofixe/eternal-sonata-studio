@@ -1,8 +1,10 @@
 #include "EFileTextureViewer.h"
 #include "Ep3Parser.h"
 #include "P3TexParser.h"
+#include "Ntx2parser.h"
 #include "Ntx3parser.h"
 #include "FileDialog.h"
+#include "../libs/bcdec/bcdec.h"
 #include <imgui.h>
 #include <iostream>
 #include <cstring>
@@ -66,6 +68,143 @@ void EFileTextureViewer::ExtractTextures(const std::vector<Chunk>& chunks, const
     uint8_t texture_id = 0;
 
     for (const auto& chunk : chunks) {
+        // NTX2 (Xbox 360 tiled texture) ──────────────────────────────
+        if (chunk.type == ChunkType::NTX2) {
+            const size_t chunk_start = chunk.offset;
+            if (chunk_start + 0x80 > file_data.size()) continue;
+            if (memcmp(&file_data[chunk_start], "NTX2", 4) != 0) continue;
+
+            const size_t chunk_sz = chunk.size;
+            if (chunk_start + chunk_sz > file_data.size()) continue;
+
+            NTX2Info info;
+            std::vector<uint8_t> rgba =
+                Ntx2Parser::Decode(&file_data[chunk_start], chunk_sz, info, chunk_start);
+
+            if (rgba.empty() || info.width <= 0 || info.height <= 0) continue;
+
+            NTX3Texture tex;
+            tex.id = texture_id++;
+            tex.offset = chunk_start;
+            tex.width = info.width;
+            tex.height = info.height;
+            tex.format = 0xFF;        // pre-decoded RGBA8, same as EP3
+            tex.data = std::move(rgba);
+
+            std::cout << "[NTX2] Texture " << (int)tex.id
+                << ": "" << info.name << """
+                << " " << tex.width << "x" << tex.height << "\n";
+
+            m_Textures.push_back(std::move(tex));
+            continue;
+        }
+
+        // NTEX (Xbox 360 DDS texture) ────────────────────────────────
+        if (chunk.type == ChunkType::NTEX) {
+            const size_t cs = chunk.offset;
+            if (cs + 8 + 128 > file_data.size()) continue;
+            if (memcmp(&file_data[cs], "NTEX", 4) != 0) continue;
+
+            const uint8_t* dds = &file_data[cs + 8];
+            if (memcmp(dds, "DDS ", 4) != 0) continue;
+
+            // DDS header is LE
+            auto le32 = [](const uint8_t* p) -> uint32_t {
+                return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+                };
+
+            const uint32_t dds_w = le32(dds + 16);
+            const uint32_t dds_h = le32(dds + 12);
+            const uint32_t ddpf_flags = le32(dds + 80);
+            char fourcc[5] = { 0 };
+            memcpy(fourcc, dds + 84, 4);
+            const uint32_t rgb_bits = le32(dds + 88);
+
+            if (dds_w == 0 || dds_h == 0) continue;
+
+            const uint8_t* pix = dds + 128;
+            const size_t   pix_avail = (cs + chunk.size > file_data.size())
+                ? 0 : chunk.size - 8 - 128;
+            if (pix_avail == 0) continue;
+
+            std::vector<uint8_t> rgba;
+
+            if (ddpf_flags & 0x4) {  // DDPF_FOURCC
+                // Standard DDS DXT: linear layout, NO block-swap, NO untiling
+                if (memcmp(fourcc, "DXT1", 4) == 0) {
+                    const int bx = int(dds_w + 3) / 4;
+                    const int by = int(dds_h + 3) / 4;
+                    rgba.resize(dds_w * dds_h * 4, 0);
+                    for (int y = 0; y < by; ++y) {
+                        for (int x = 0; x < bx; ++x) {
+                            size_t src_off = size_t(y * bx + x) * 8;
+                            if (src_off + 8 > pix_avail) continue;
+                            uint8_t dec[64];
+                            bcdec_bc1(pix + src_off, dec, 16);
+                            for (int py = 0; py < 4; ++py)
+                                for (int px = 0; px < 4; ++px) {
+                                    int gx = x * 4 + px, gy = y * 4 + py;
+                                    if (uint32_t(gx) >= dds_w || uint32_t(gy) >= dds_h) continue;
+                                    int s = (py * 4 + px) * 4, d = (gy * int(dds_w) + gx) * 4;
+                                    rgba[d] = dec[s]; rgba[d + 1] = dec[s + 1]; rgba[d + 2] = dec[s + 2]; rgba[d + 3] = dec[s + 3];
+                                }
+                        }
+                    }
+                }
+                else if (memcmp(fourcc, "DXT5", 4) == 0) {
+                    const int bx = int(dds_w + 3) / 4;
+                    const int by = int(dds_h + 3) / 4;
+                    rgba.resize(dds_w * dds_h * 4, 0);
+                    for (int y = 0; y < by; ++y) {
+                        for (int x = 0; x < bx; ++x) {
+                            size_t src_off = size_t(y * bx + x) * 16;
+                            if (src_off + 16 > pix_avail) continue;
+                            uint8_t dec[64];
+                            bcdec_bc3(pix + src_off, dec, 16);
+                            for (int py = 0; py < 4; ++py)
+                                for (int px = 0; px < 4; ++px) {
+                                    int gx = x * 4 + px, gy = y * 4 + py;
+                                    if (uint32_t(gx) >= dds_w || uint32_t(gy) >= dds_h) continue;
+                                    int s = (py * 4 + px) * 4, d = (gy * int(dds_w) + gx) * 4;
+                                    rgba[d] = dec[s]; rgba[d + 1] = dec[s + 1]; rgba[d + 2] = dec[s + 2]; rgba[d + 3] = dec[s + 3];
+                                }
+                        }
+                    }
+                }
+            }
+            else if (rgb_bits == 16) {
+                // L8A8 (luminance + alpha): R=G=B=byte0, A=byte1
+                const size_t npix = dds_w * dds_h;
+                if (npix * 2 <= pix_avail) {
+                    rgba.resize(npix * 4);
+                    for (size_t k = 0; k < npix; ++k) {
+                        uint8_t lum = pix[k * 2];
+                        uint8_t alp = pix[k * 2 + 1];
+                        rgba[k * 4 + 0] = lum; rgba[k * 4 + 1] = lum;
+                        rgba[k * 4 + 2] = lum; rgba[k * 4 + 3] = alp;
+                    }
+                }
+            }
+
+            if (rgba.empty()) continue;
+
+            NTX3Texture tex;
+            tex.id = texture_id++;
+            tex.offset = cs;
+            tex.width = int(dds_w);
+            tex.height = int(dds_h);
+            tex.format = 0xFF;
+            tex.data = std::move(rgba);
+
+            std::cout << "[NTEX] Texture " << int(tex.id)
+                << ": " << fourcc
+                << " " << tex.width << "x" << tex.height << "\n";
+
+            m_Textures.push_back(std::move(tex));
+            continue;
+        }
+
+        // NTX3 (PS3 texture) ──────────────────────────────────────────
         if (chunk.type != ChunkType::NTX3) {
             continue;
         }
@@ -107,7 +246,7 @@ void EFileTextureViewer::ExtractTextures(const std::vector<Chunk>& chunks, const
         m_Textures.push_back(tex);
     }
 
-    std::cout << "Extracted " << m_Textures.size() << " textures from .e file" << std::endl;
+    std::cout << "Extracted " << m_Textures.size() << " textures from file" << std::endl;
 }
 
 void EFileTextureViewer::Render() {

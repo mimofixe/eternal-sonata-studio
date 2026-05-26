@@ -13,8 +13,34 @@ uint32_t TutorialParser::ReadU32BE(const uint8_t* d) {
 
 bool TutorialParser::IsTutorialFile(const uint8_t* data, size_t size) {
     if (size < 0x18) return false;
-    return ReadU32BE(data + 0x00) == 0x00000181 &&
-        ReadU32BE(data + 0x10) == TUTORIAL_CODE_SIZE;
+    if (ReadU32BE(data + 0x00) != 0x00000181) return false;
+    if (ReadU32BE(data + 0x10) != TUTORIAL_CODE_SIZE) return false;
+
+    // Scene .e files share the same magic and code_size.
+    // Tutorial files have a CSL audio table at 0x2000 with audio sections packed
+    // immediately after it.  We need three progressive checks:
+
+    // 1. The 4 bytes at 0x2000 must be "CSL ".
+    //    Scene files that have Mefc/NOBJ at 0x2000 (e.g. Tnk01.e) are rejected here.
+    if (size < 0x2004) return true;   // buffer too small to check further — accept tentatively
+    if (memcmp(data + 0x2000, "CSL ", 4) != 0) return false;
+
+    // 2. The CSL declared size (at 0x2004) must be large enough to hold at least
+    //    one offset entry (magic + size + pad + 1 offset + terminator = 0x14).
+    //    Scene files can have a stub CSL of size 8 (e.g. e0041.e).
+    if (size < 0x2008) return true;
+    const uint32_t csl_size = ReadU32BE(data + 0x2004);
+    if (csl_size < 0x10) return false;
+
+    // 3. The first CSF-section offset stored in the CSL (at CSL+0x0C = 0x200C) must
+    //    point to a "nearby" section — tutorial audio sections are packed immediately
+    //    after the CSL table, so the offset is always small (< 0x4000).
+    //    Scene files have large offsets (e.g. e1141.e: first_offset=0xC000).
+    if (size < 0x2010) return true;
+    const uint32_t first_offset = ReadU32BE(data + 0x200C);
+    if (first_offset == 0 || first_offset >= 0x4000) return false;
+
+    return true;
 }
 
 bool TutorialParser::IsTutorialFile(const std::string& filepath) {

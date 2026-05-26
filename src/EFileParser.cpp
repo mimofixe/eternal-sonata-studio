@@ -32,6 +32,8 @@ ChunkType EFileParser::GetChunkType(uint32_t magic) {
     if (magic == MAGIC_NMDL) return ChunkType::NMDL;
     if (magic == MAGIC_NSHP) return ChunkType::NSHP;
     if (magic == MAGIC_NTX3) return ChunkType::NTX3;
+    if (magic == MAGIC_NTX2) return ChunkType::NTX2;
+    if (magic == MAGIC_NTEX) return ChunkType::NTEX;
     if (magic == MAGIC_NMTN) return ChunkType::NMTN;
     if (magic == MAGIC_NCAM) return ChunkType::NCAM;
     if (magic == MAGIC_NLIT) return ChunkType::NLIT;
@@ -79,7 +81,7 @@ std::vector<Chunk> EFileParser::Parse(const std::string& filepath) {
     // FIX: MAGIC_CSF added to scan array (was recognised in GetChunkType but
     // missing here, so CSF chunks inside .e files were silently skipped)
     const uint32_t magics[] = {
-        MAGIC_NOBJ, MAGIC_NMDL, MAGIC_NSHP, MAGIC_NTX3, MAGIC_NMTN,
+        MAGIC_NOBJ, MAGIC_NMDL, MAGIC_NSHP, MAGIC_NTX3, MAGIC_NTX2, MAGIC_NTEX, MAGIC_NMTN,
         MAGIC_NCAM, MAGIC_NLIT, MAGIC_NFOG, MAGIC_NMTR, MAGIC_SONG,
         MAGIC_NBN2, MAGIC_NMTB, MAGIC_NDYN, MAGIC_NLC2, MAGIC_NCLS,
         MAGIC_CSF

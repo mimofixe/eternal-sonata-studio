@@ -7,6 +7,7 @@
 #include <iostream>
 #include <fstream>
 #include <set>
+#include <filesystem>
 #include "EFileParser.h"
 #include "BOPParser.h"
 #include "ContainerParser.h"
@@ -24,6 +25,8 @@
 #include "Ep3Parser.h"
 #include "EFileTextExtractor.h" 
 #include "CSFViewer.h"
+#include "AnimViewport.h"
+#include "TcxDecompressor.h"
 
 Application::Application(const AppConfig& config)
     : m_Config(config), m_Running(false) {
@@ -84,6 +87,7 @@ void Application::Run() {
     CSFViewer csf_viewer;
     AIScriptViewer ai_script_viewer;
     TutorialViewer tutorial_viewer;
+    AnimViewport   anim_viewport;
 
     chunk_inspector.SetViewport(&viewport);
     chunk_inspector.SetP3TexParser(&m_P3TexParser);
@@ -95,9 +99,29 @@ void Application::Run() {
     std::string current_file_path;
     int selected_chunk_idx = -1;
     bool is_container_file = false;
+    bool was_compressed = false;
     std::set<int> csf_checked;
     bool show_csf_batch_result = false;
     int csf_batch_exported = 0;
+
+    // If `path` is a Tcx-compressed file, decompress it to a stable temp file
+    // and return the temp path. Otherwise returns `path` unchanged.
+    auto resolveDecompressedPath = [](const std::string& path, bool* out_was_compressed) -> std::string {
+        if (out_was_compressed) *out_was_compressed = false;
+        bool comp = false;
+        std::vector<uint8_t> bytes = TcxDecompressor::LoadAndMaybeDecompress(path, &comp);
+        if (!comp || bytes.empty()) return path;
+        std::filesystem::path src(path);
+        std::filesystem::path tmp =
+            std::filesystem::temp_directory_path() /
+            (src.stem().string() + ".tcx_decompressed" + src.extension().string());
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return path;
+        out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
+        out.close();
+        if (out_was_compressed) *out_was_compressed = true;
+        return tmp.string();
+        };
 
     while (!glfwWindowShouldClose(window) && m_Running) {
         glfwPollEvents();
@@ -105,6 +129,8 @@ void Application::Run() {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+
+        anim_viewport.Tick(ImGui::GetIO().DeltaTime);
 
         ImGuiID dockspace_id = ImGui::DockSpaceOverViewport();
 
@@ -125,12 +151,18 @@ void Application::Run() {
             ImGui::EndMainMenuBar();
         }
 
-        ImGui::Begin("Texture Archive (P3TEX)");
+        ImGui::Begin("Texture Archive (P3TEX / X3TEX)");
 
-        if (ImGui::Button("Load P3TEX...", ImVec2(200, 0))) {
-            std::string path = FileDialog::OpenFile("P3TEX Files\0*.p3tex\0All Files\0*.*\0");
+        if (ImGui::Button("Load P3TEX / X3TEX...", ImVec2(220, 0))) {
+            std::string path = FileDialog::OpenFile(
+                "Texture Archives\0*.p3tex;*.x3tex\0P3TEX (PS3)\0*.p3tex\0X3TEX (Xbox 360)\0*.x3tex\0All Files\0*.*\0");
             if (!path.empty()) {
-                m_P3TexParser.Load(path);
+                // Xbox 360 retail .x3tex files use the proprietary Tcx
+                // compression. The decompressor passes uncompressed files
+                // (PS3 .p3tex and demo .x3tex) through unchanged.
+                bool comp = false;
+                std::string load_path = resolveDecompressedPath(path, &comp);
+                m_P3TexParser.Load(load_path);
                 tex_viewer.SetParser(&m_P3TexParser);
             }
         }
@@ -156,7 +188,7 @@ void Application::Run() {
             ImGui::TextDisabled("Not loaded");
 
             ImGui::Separator();
-            ImGui::TextWrapped("Load a .p3tex texture archive.");
+            ImGui::TextWrapped("Load a .p3tex (PS3) or .x3tex (Xbox 360) texture archive.");
         }
 
         ImGui::End();
@@ -185,6 +217,10 @@ void Application::Run() {
         tutorial_viewer.Render();
         ImGui::End();
 
+        ImGui::Begin("Animation Viewport");
+        anim_viewport.Render();
+        ImGui::End();
+
         ImGui::Begin("File Browser");
         file_browser.Render();
 
@@ -205,20 +241,28 @@ void Application::Run() {
                 loaded_chunks.clear();
                 container_sections.clear();
                 is_container_file = false;
+                was_compressed = false;
                 csf_checked.clear();
 
+                // Xbox 360 retail auto-decompression. If this file uses the
+                // proprietary Tcx arithmetic+LZSS format, decompress it once
+                // into a temp file and route all downstream parsers through
+                // that path. Demo / already-uncompressed files pass straight
+                // through and `effective_path` stays equal to the original.
+                std::string effective_path = resolveDecompressedPath(current_file_path, &was_compressed);
+
                 if (extension == ".csf") {
-                    csf_viewer.LoadFile(current_file_path);
+                    csf_viewer.LoadFile(effective_path);
                 }
                 else if (extension == ".bmd") {
-                    auto container = ContainerParser::Parse(current_file_path);
+                    auto container = ContainerParser::Parse(effective_path);
 
                     if (container.type != ContainerType::Unknown) {
                         container_sections = container.sections;
                         loaded_chunks = container.all_chunks;
                         is_container_file = true;
 
-                        std::ifstream file(current_file_path, std::ios::binary);
+                        std::ifstream file(effective_path, std::ios::binary);
                         if (file) {
                             file.seekg(0, std::ios::end);
                             size_t size = file.tellg();
@@ -231,28 +275,27 @@ void Application::Run() {
 
                         efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
                         text_extractor.LoadFromFile(current_file_data);
-                        csf_viewer.SetFileContext(current_file_data, loaded_chunks); // NEW
+                        csf_viewer.SetFileContext(current_file_data, loaded_chunks);
 
                         if (container.has_csf) {
-                            csf_viewer.LoadFile(current_file_path);
+                            csf_viewer.LoadFile(effective_path);
                         }
                     }
                 }
                 else if (extension == ".e" || extension == ".bop" || extension == ".p3obj") {
-                    // Read enough header bytes to distinguish tutorial vs AI script vs container
-                    uint8_t hdr[0x18] = {};
+                    uint8_t hdr[0x2010] = {};
                     {
-                        std::ifstream probe(current_file_path, std::ios::binary);
+                        std::ifstream probe(effective_path, std::ios::binary);
                         if (probe) probe.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
                     }
 
                     if (TutorialParser::IsTutorialFile(hdr, sizeof(hdr))) {
-                        tutorial_viewer.Load(current_file_path);
+                        tutorial_viewer.Load(effective_path);
                         ai_script_viewer.Clear();
                         selected_chunk_idx = -1;
                     }
                     else if (AIScriptParser::IsAIScript(hdr, sizeof(hdr))) {
-                        ai_script_viewer.Load(current_file_path);
+                        ai_script_viewer.Load(effective_path);
                         tutorial_viewer.Clear();
                         selected_chunk_idx = -1;
                     }
@@ -261,13 +304,13 @@ void Application::Run() {
                         tutorial_viewer.Clear();
 
                         if (extension == ".bop") {
-                            loaded_chunks = BOPParser::Parse(current_file_path);
+                            loaded_chunks = BOPParser::Parse(effective_path);
                         }
                         else {
-                            loaded_chunks = EFileParser::Parse(current_file_path);
+                            loaded_chunks = EFileParser::Parse(effective_path);
                         }
 
-                        std::ifstream file(current_file_path, std::ios::binary);
+                        std::ifstream file(effective_path, std::ios::binary);
                         if (file) {
                             file.seekg(0, std::ios::end);
                             size_t size = file.tellg();
@@ -281,20 +324,20 @@ void Application::Run() {
 
                         efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
                         text_extractor.LoadFromFile(current_file_data);
-                        csf_viewer.SetFileContext(current_file_data, loaded_chunks); // NEW
+                        csf_viewer.SetFileContext(current_file_data, loaded_chunks);
+                        anim_viewport.LoadFromChunks(current_file_data, loaded_chunks);
                     }
                 }
                 else if (extension == ".ep3") {
                     Ep3File ep3_tmp;
-                    if (Ep3Parser::Load(current_file_path, ep3_tmp)) {
-                        current_file_data = ep3_tmp.raw; // copy for chunk inspector
+                    if (Ep3Parser::Load(effective_path, ep3_tmp)) {
+                        current_file_data = ep3_tmp.raw;
 
-                        // Build chunk list so the Chunks window shows EP3 frames.
                         loaded_chunks.clear();
                         for (size_t fi = 0; fi < ep3_tmp.frames.size(); fi++) {
                             const Ep3Frame& fr = ep3_tmp.frames[fi];
                             Chunk c;
-                            c.magic = 0x3358544E; // "NTX3"
+                            c.magic = 0x3358544E;
                             c.size = static_cast<uint32_t>(fr.pixel_size + 0x80);
                             c.offset = fr.pixel_offset - 0x80;
                             c.type = ChunkType::NTX3;
@@ -303,16 +346,16 @@ void Application::Run() {
                                 fr.swizzled ? "_swz" : "");
                             loaded_chunks.push_back(c);
                         }
-                        efile_tex_viewer.LoadFromEp3(current_file_path);
+                        efile_tex_viewer.LoadFromEp3(effective_path);
                     }
                 }
                 else if (extension == ".tex") {
-                    auto tex = TEXParser::Parse(current_file_path);
+                    auto tex = TEXParser::Parse(effective_path);
 
                     if (tex.valid) {
                         loaded_chunks = tex.chunks;
 
-                        std::ifstream file(current_file_path, std::ios::binary);
+                        std::ifstream file(effective_path, std::ios::binary);
                         if (file) {
                             file.seekg(0, std::ios::end);
                             size_t size = file.tellg();
@@ -324,8 +367,14 @@ void Application::Run() {
 
                         selected_chunk_idx = -1;
                         efile_tex_viewer.LoadFromFile(loaded_chunks, current_file_data);
-                        csf_viewer.SetFileContext(current_file_data, loaded_chunks); // NEW
+                        csf_viewer.SetFileContext(current_file_data, loaded_chunks);
                     }
+                }
+                else if (extension == ".p3tex" || extension == ".x3tex") {
+                    // Texture archive selected from the file browser: route
+                    // through the same path as the dedicated Load button.
+                    m_P3TexParser.Load(effective_path);
+                    tex_viewer.SetParser(&m_P3TexParser);
                 }
             }
         }
@@ -337,6 +386,10 @@ void Application::Run() {
         }
         else {
             ImGui::Text("File: %s", current_file_path.c_str());
+            if (was_compressed) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                    "[Xbox 360 retail - auto-decompressed]");
+            }
             ImGui::Text("Total Chunks: %d", (int)loaded_chunks.size());
 
             if (is_container_file) {
@@ -557,7 +610,6 @@ void Application::Run() {
 
                 ImGui::EndTable();
 
-                // CSF batch export panel — shown whenever the loaded file has CSF chunks
                 std::vector<int> csf_indices;
                 for (int i = 0; i < (int)loaded_chunks.size(); i++) {
                     if (loaded_chunks[i].type == ChunkType::CSF) csf_indices.push_back(i);
@@ -568,7 +620,6 @@ void Application::Run() {
                     ImGui::Text("CSF Audio Export (%d tracks)", (int)csf_indices.size());
                     ImGui::Separator();
 
-                    // Scrollable checkbox list
                     ImGui::BeginChild("CSFCheckList", ImVec2(0, 120), true);
                     for (int j = 0; j < (int)csf_indices.size(); j++) {
                         int chunk_idx = csf_indices[j];
@@ -593,7 +644,6 @@ void Application::Run() {
 
                     ImGui::Spacing();
 
-                    // Export selected
                     ImGui::BeginDisabled(csf_checked.empty());
                     char sel_label[48];
                     snprintf(sel_label, sizeof(sel_label), "Export Selected (%d)", (int)csf_checked.size());
@@ -622,7 +672,6 @@ void Application::Run() {
                     }
                     ImGui::EndDisabled();
 
-                    // Export all
                     if (ImGui::Button("Export All CSF", ImVec2(-1, 0))) {
                         std::string base = FileDialog::SaveFile("ATRAC3 Audio\0*.at3\0All Files\0*.*\0");
                         if (!base.empty()) {
@@ -646,7 +695,6 @@ void Application::Run() {
                         }
                     }
 
-                    // Result popup
                     if (show_csf_batch_result) {
                         ImGui::OpenPopup("CSF Export Result");
                         show_csf_batch_result = false;

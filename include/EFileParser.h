@@ -8,6 +8,8 @@ constexpr uint32_t MAGIC_NOBJ = 0x4A424F4E;
 constexpr uint32_t MAGIC_NMDL = 0x4C444D4E;
 constexpr uint32_t MAGIC_NSHP = 0x5048534E;
 constexpr uint32_t MAGIC_NTX3 = 0x3358544E;
+constexpr uint32_t MAGIC_NTX2 = 0x3258544E;  // "NTX2" Xbox 360 texture
+constexpr uint32_t MAGIC_NTEX = 0x5845544E;  // "NTEX" Xbox 360 DDS texture
 constexpr uint32_t MAGIC_NMTN = 0x4E544D4E;
 constexpr uint32_t MAGIC_NCAM = 0x4D41434E;
 constexpr uint32_t MAGIC_NLIT = 0x54494C4E;
@@ -32,6 +34,8 @@ enum class ChunkType {
     NMDL,
     NSHP,
     NTX3,
+    NTX2,   // Xbox 360 tiled texture
+    NTEX,   // Xbox 360 DDS texture (in BMD/Mefc sections)
     NMTN,
     NCAM,
     NLIT,
@@ -70,6 +74,8 @@ struct Chunk {
         case ChunkType::NMDL: return "NMDL";
         case ChunkType::NSHP: return "NSHP";
         case ChunkType::NTX3: return "NTX3";
+        case ChunkType::NTX2: return "NTX2";
+        case ChunkType::NTEX: return "NTEX";
         case ChunkType::NMTN: return "NMTN";
         case ChunkType::NCAM: return "NCAM";
         case ChunkType::NLIT: return "NLIT";
@@ -97,6 +103,8 @@ struct Chunk {
         case ChunkType::NMDL: return "Model Metadata";
         case ChunkType::NSHP: return "3D Mesh";
         case ChunkType::NTX3: return "Texture";
+        case ChunkType::NTX2: return "Texture (Xbox360)";
+        case ChunkType::NTEX: return "Texture (DDS)";
         case ChunkType::NMTN: return "Animation";
         case ChunkType::NCAM: return "Camera";
         case ChunkType::NLIT: return "Light";

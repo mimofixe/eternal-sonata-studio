@@ -99,16 +99,16 @@ bool NBN2Parser::Parse(const uint8_t* data, size_t size, std::vector<Bone>& out)
     return true;
 }
 
-// BONESPACE algorithm from Blender 2.49 skeletonLib.py:
-//   bone.head   = posVec * parent.matrix + parent.head    (row-vector convention)
+// BONESPACE algorithm from Blender 2.49 skeletonLib.py (row-vector convention):
+//   bone.head   = posVec * parent.matrix + parent.head
 //   bone.matrix = localRot * parent.matrix
 //
-// Translated to GLM column-major:
-//   world_pos = transpose(parent_world_rot) * local_pos + parent_world_pos
-//   world_rot = local_rot * parent_world_rot
+// Converting row→column (M_col = M_row^T, so (A*B)_col = B_col * A_col):
+//   world_pos = parent_world_rot * local_pos + parent_world_pos
+//   world_rot = parent_world_rot * local_rot        ← parent THEN local
 //
-// Bones are stored parent-before-child, so a single forward pass is sufficient.
-// Verified numerically: Jbelt (rz=+90°, parent=Jhip rz=-90°) yields world_rot=I ✓
+// Note: the previous formulas (world_rot = lr * parent, world_pos = transpose(parent)*lp)
+// were wrong. Z-axis-only rotations commute so that test did not catch the error.
 
 void NBN2Parser::ComputeWorldPositions(std::vector<Bone>& bones) {
     for (size_t i = 0; i < bones.size(); i++) {
@@ -125,8 +125,8 @@ void NBN2Parser::ComputeWorldPositions(std::vector<Bone>& bones) {
         }
         else {
             const Bone& p = bones[par];
-            bone.world_pos = glm::transpose(p.world_rot) * lp + p.world_pos;
-            bone.world_rot = lr * p.world_rot;
+            bone.world_pos = p.world_rot * lp + p.world_pos;
+            bone.world_rot = p.world_rot * lr;
         }
     }
 }

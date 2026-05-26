@@ -197,8 +197,10 @@ void P3TexViewer::RenderDetail() {
     ImGui::Separator();
 
     ImGui::Text("Dimensions: %dx%d", tex->width, tex->height);
+    if (!tex->name.empty())
+        ImGui::Text("Name: %s", tex->name.c_str());
     ImGui::Text("Data Size: %zu bytes", tex->size);
-    ImGui::Text("Format: %s", (tex->format & 0xDF) == 0x86 ? "DXT1" : (tex->format == 0xA5 ? "RGBA8" : "DXT5"));
+    ImGui::Text("Format: %s", (tex->format == P3TEX_FORMAT_RGBA8_DECODED) ? "Xbox360 DXT1" : ((tex->format & 0xDF) == 0x86 ? "DXT1" : (tex->format == 0xA5 ? "RGBA8" : "DXT5")));
 
     float aspect = (float)tex->width / tex->height;
     ImGui::Text("Aspect Ratio: %.2f:1", aspect);
@@ -271,7 +273,10 @@ void P3TexViewer::GeneratePreview(uint8_t textureId) {
     }
 
     std::vector<uint8_t> rgba;
-    if ((tex->format & 0xDF) == 0x86) {
+    if (tex->format == P3TEX_FORMAT_RGBA8_DECODED) {
+        rgba = tex->data;  // Xbox360 NTX2: already decoded to RGBA8
+    }
+    else if ((tex->format & 0xDF) == 0x86) {
         rgba = P3TexParser::DecompressDXT1(tex->data.data(), tex->width, tex->height);
     }
     else if (tex->format == 0xA5) {
@@ -318,7 +323,10 @@ void P3TexViewer::ExportTexturePNG(uint8_t textureId) {
 
     // Decompress texture
     std::vector<uint8_t> rgba;
-    if ((tex->format & 0xDF) == 0x86) {
+    if (tex->format == P3TEX_FORMAT_RGBA8_DECODED) {
+        rgba = tex->data;  // Xbox360 NTX2: already decoded to RGBA8
+    }
+    else if ((tex->format & 0xDF) == 0x86) {
         rgba = P3TexParser::DecompressDXT1(tex->data.data(), tex->width, tex->height);
     }
     else if (tex->format == 0xA5) {
