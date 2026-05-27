@@ -257,37 +257,124 @@ void AnimViewport::BuildInvBind() {
         m_InvBind[i] = glm::inverse(WorldMat(m_BindBones[i]));
 }
 
-// Pose application
+// Local helpers for the corrected pose application
+
+// Euler XYZ -> rotation matrix (column-major, same convention as NBN2Parser).
+// Result = Rz * Ry * Rx. Duplicated here to avoid having to expose
+// NBN2Parser::EulerXYZ publicly.
+static glm::mat3 AVEulerXYZ(float rx, float ry, float rz) {
+    float cx = std::cos(rx), sx = std::sin(rx);
+    float cy = std::cos(ry), sy = std::sin(ry);
+    float cz = std::cos(rz), sz = std::sin(rz);
+    glm::mat3 Rx(
+        1.f, 0.f, 0.f,
+        0.f, cx, sx,
+        0.f, -sx, cx
+    );
+    glm::mat3 Ry(
+        cy, 0.f, -sy,
+        0.f, 1.f, 0.f,
+        sy, 0.f, cy
+    );
+    glm::mat3 Rz(
+        cz, sz, 0.f,
+        -sz, cz, 0.f,
+        0.f, 0.f, 1.f
+    );
+    return Rz * Ry * Rx;
+}
+
+// Quaternion (x, y, z, w) -> rotation matrix (column-major).
+static glm::mat3 QuatToMat3(float qx, float qy, float qz, float qw) {
+    float n = qx * qx + qy * qy + qz * qz + qw * qw;
+    if (n < 1e-12f) return glm::mat3(1.f);
+    float s = 2.0f / n;
+    return glm::mat3(
+        // col 0
+        1.f - s * (qy * qy + qz * qz),
+        s * (qx * qy + qz * qw),
+        s * (qx * qz - qy * qw),
+        // col 1
+        s * (qx * qy - qz * qw),
+        1.f - s * (qx * qx + qz * qz),
+        s * (qy * qz + qx * qw),
+        // col 2
+        s * (qx * qz + qy * qw),
+        s * (qy * qz - qx * qw),
+        1.f - s * (qx * qx + qy * qy)
+    );
+}
+
+// Pose application — verified against pcalg_v1.p3obj (Allegretto idle).
+//
+// Translation bones (move / pos / Top1):
+//   absolute position from c0/c1/c2 (already scaled to /32768 by parser)
+//
+// Rotation bones with 3 channels:
+//   (c0, c1, c2) = quaternion (qx, qy, qz), qw = sqrt(1 - mag²)
+//   applied as DELTA in bone-local space: local_rot = bind_local * quat_mat
+//
+// Rotation bones with 1 or 2 channels: kept in bind pose for now —
+// the flag bits at +0x14 of the track header probably indicate which
+// axis is being animated, but the encoding hasn't been decoded yet.
 void AnimViewport::ApplyPose(float frame) {
     if (m_Anims.empty()) return;
     const NMTNAnimation& anim = m_Anims[m_AnimIdx];
 
-    // Start from bind pose every frame
     m_AnimBones = m_BindBones;
+    const size_t N = m_AnimBones.size();
 
+    // Build per-bone local (position, rotation matrix) from bind pose first
+    std::vector<glm::vec3> local_pos(N);
+    std::vector<glm::mat3> local_rot(N);
+    for (size_t i = 0; i < N; i++) {
+        const Bone& b = m_AnimBones[i];
+        local_pos[i] = glm::vec3(b.local_x, b.local_y, b.local_z);
+        local_rot[i] = AVEulerXYZ(b.rot_x, b.rot_y, b.rot_z);
+    }
+
+    // Apply animation overrides per track
     for (const auto& track : anim.tracks) {
         if (track.is_static) continue;
 
         auto it = m_BoneIndexMap.find(track.bone_name);
         if (it == m_BoneIndexMap.end()) continue;
-        Bone& b = m_AnimBones[it->second];
+        const int idx = it->second;
 
         if (track.is_translation) {
-            // move/pos/Top1: c0→dx(lateral)  c2→dy(vertical)  c1→dz(skip root-motion)
-            b.local_x += track.ry.Sample(frame, 0.f);  // c0 stored in ry → dx lateral
-            b.local_y += track.rz.Sample(frame, 0.f);  // c2 stored in rz → dy vertical
-            // track.rx = c1 (root-motion forward) — intentionally skipped
+            // Absolute position override (per-component if channel present)
+            if (!track.c0.Empty()) local_pos[idx].x = track.c0.Sample(frame, 0.f);
+            if (!track.c1.Empty()) local_pos[idx].y = track.c1.Sample(frame, 0.f);
+            if (!track.c2.Empty()) local_pos[idx].z = track.c2.Sample(frame, 0.f);
         }
-        else {
-            // Rotation bones: YXZ mapping (c0→ry, c1→rx, c2→rz)
-            // All values are deltas in radians, added to NBN2 bind-pose angles
-            b.rot_y += track.ry.Sample(frame, 0.f);  // c0: primary sagittal
-            b.rot_x += track.rx.Sample(frame, 0.f);  // c1
-            b.rot_z += track.rz.Sample(frame, 0.f);  // c2
+        else if (track.channel_count == 3) {
+            // Quaternion delta — smallest-three compression (qw reconstructed)
+            float qx = track.c0.Sample(frame, 0.f);
+            float qy = track.c1.Sample(frame, 0.f);
+            float qz = track.c2.Sample(frame, 0.f);
+            float mag2 = qx * qx + qy * qy + qz * qz;
+            float qw = std::sqrt(std::max(0.f, 1.f - mag2));
+            local_rot[idx] = local_rot[idx] * QuatToMat3(qx, qy, qz, qw);
         }
+        // else: 1 or 2 channels (TODO), leave bind rotation
     }
 
-    NBN2Parser::ComputeWorldPositions(m_AnimBones);
+    // Forward kinematics: world = parent_world * local (same convention as
+    // NBN2Parser::ComputeWorldPositions). Walking in array order is safe
+    // because the file guarantees parents come before children.
+    for (size_t i = 0; i < N; i++) {
+        Bone& b = m_AnimBones[i];
+        const int par = b.parent_idx;
+        if (par < 0 || par >= (int)N) {
+            b.world_pos = local_pos[i];
+            b.world_rot = local_rot[i];
+        }
+        else {
+            const Bone& p = m_AnimBones[par];
+            b.world_pos = p.world_rot * local_pos[i] + p.world_pos;
+            b.world_rot = p.world_rot * local_rot[i];
+        }
+    }
 }
 
 void AnimViewport::RebuildSkeletonLines() {
