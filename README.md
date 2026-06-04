@@ -105,6 +105,12 @@ The NMTN format is now decoded from the Xbox 360 executable, so the motion plays
 
 `.bmd` party archives such as `appkeep2.bmd` expose each NOBJ as a selectable model with its own skeleton and animation set. Files that ship NMTN tracks with no NBN2 (shared field-event banks for door and chest interactions) are parsed as a skeleton-less animation list, so the motions are surfaced even though there is no rig in the file to pose.
 
+### Cloth Physics (experimental, not yet correct)
+
+Dynamic bone chains (skirts, capes, ribbons, the `JD` and `eff` bones, identified by an NBN2 flag other than `96` or `224`) drive a Dynabone cloth simulation on top of the animated pose. Per-bone parameters come from the `NDYN` chunk and body colliders from the `NCLS` chunk. The solver is a Verlet plus position-based-dynamics step at a fixed `1/60` substep: a damped Verlet velocity, gravity as a mass-independent acceleration, a pull back toward the rest direction in the moving parent frame, then a hard length constraint and sphere collision. A Cloth toggle and a Gravity slider are exposed in the viewport toolbar.
+
+The simulated motion is not correct yet. The solver structure follows the decoded engine but the parameter scaling, the restoring term, and the collider set are still being calibrated, so cloth does not yet match the in-game look. It is present for debugging the format.
+
 ### AI Behaviour Scripts
 
 Full analysis of the compiled AI scripts that drive enemy and boss behaviour in battle. These are `.e` files with magic `0x00000181` - a different format from the regular `.e` containers.
@@ -203,6 +209,10 @@ Each channel is a `u16` keyframe count, an exponent byte `fmt` in the range `0x0
 
 Rotation channels get three correctness passes at parse time: antipodal Euler flip detection (`E(a,b,c)` equals `E(a-pi, pi-b, c-pi)`), per-axis unwrap when a channel crosses plus or minus pi, and a tangent rebuild from the corrected values to stop cubic Hermite overshoot.
 
+### NDYN / NCLS Chunks
+
+Cloth (Dynabone) data for a character model. `NDYN` holds 48-byte per-bone records: bone index at `+0x02`, mass A at `+0x08`, return strength B at `+0x10`, damping C at `+0x14`, and an unused D at `+0x1C`. `NCLS` holds 48-byte collision sphere records: radius at `+0x04`, bone index at `+0x26`, and a bone-local offset as three i16 at `+0x28` scaled by `1/64`. Only limb-scale spheres are used; collision is sphere-only (the ellipse-cylinder variant is a no-op in the engine). A bone participates in the simulation when its NBN2 flag is neither `96` nor `224`.
+
 ### NLIT Chunks
 
 Scene lighting data. Contains ambient colour (RGB bytes) and a directional light colour and direction. Parsed into `LightData` and forwarded to the viewport via `SetSceneLighting`. The viewer reconstructs the light direction from interactive pitch/yaw sliders rather than the raw direction field.
@@ -249,6 +259,7 @@ eternal-sonata-studio/
 
 ## Known Limitations
 
+- Dynabone cloth physics is implemented but the simulated motion is not yet correct; parameter scaling and collider selection still need calibration
 - Skinned mesh vertex normals are not yet decoded correctly; geometric normals are used as a workaround in the viewer
 - One sequential mesh variant is still unparsed: a multi-section sequential draw at stride 24 (the dandelion fluff `watage_ten`)
 - NTX2 DXT5 and RGBA8 paths are present but not exhaustively tested
@@ -304,6 +315,12 @@ The AnimViewport ties NBN2, the skinned NSHP inside the NMDL envelope, and NMTN 
 Channel routing is no longer a guess: the nine 3-bit slot fields name each channel directly (position XYZ, rotation XYZ, scale XYZ). The tangents are read and used, so smooth easing is reproduced rather than flattened to a ramp. Rotation channels are corrected for antipodal Euler flips and for wraparound past plus or minus pi, and their tangents are rebuilt from the corrected values, which removes the per-frame tweak and tremble artifacts. The remaining animation work is in skinned vertex normals, which the viewer still substitutes with geometric normals.
 
 `.bmd` party archives feed the viewport through the same path as `.e` files, and each NOBJ becomes its own model. Archives that contain NMTN tracks but no NBN2 are parsed as a skeleton-less animation list so the motions are not dropped.
+
+### Cloth Physics
+
+Dynamic bones are simulated with a Verlet plus PBD step at a fixed `1/60` substep, layered on the rigid pose each frame. A bone is dynamic when its NBN2 flag is neither `96` nor `224`. Per step: velocity is `(pCur - pPrev) * (1 - damping)`; the predicted position adds gravity as a mass-independent acceleration (`9.80665`); the position is pulled toward `parentPos + parentSimRot * localOffset` by the return strength; then two PBD iterations apply a hard length constraint (rescale to the bind rest length) and push the particle out of any `NCLS` sphere. The parent's simulated rotation cascades to its children and root cloth bones are pinned. The chain is settled for 24 substeps on load and advanced on a fixed-timestep accumulator at runtime, independent of the render framerate.
+
+This pipeline is wired up but does not yet reproduce the in-game cloth. The solver shape is right; the parameter scaling, the restoring term, and the collider selection still need calibration.
 
 ### Scene Lighting
 
