@@ -6,6 +6,7 @@
 
 // Bone
 // Layout confirmed from EternalSonataPS3.py (old scrippt found in a forum lol)
+// + reverse-engineering with rot2 found through pcalg sword position validation.
 //
 //   offset  type      field
 //   +0x00   char[16]  name          (null-terminated)
@@ -13,9 +14,14 @@
 //   +0x12   i16       parent_idx    (-1 = root)
 //   +0x14   i16       child_idx     (first child, -1 = leaf)
 //   +0x16   i16       sibling_idx   (next sibling, -1 = last)
-//   +0x18   i16       rot_x_fixed   Euler X in radians × 4096  (i16 / 4096 = rad)
-//   +0x1A   i16       rot_y_fixed   Euler Y
-//   +0x1C   i16       rot_z_fixed   Euler Z
+//   +0x18   i16       rot1_x_fixed  Euler X (radians × 4096)  — primary rotation
+//   +0x1A   i16       rot1_y_fixed  Euler Y
+//   +0x1C   i16       rot1_z_fixed  Euler Z
+//   +0x1E..0x23       (6 bytes, unused — always zero in pcalg/pcbet)
+//   +0x24   i16       rot2_x_fixed  Euler X (radians × 4096)  — SECONDARY rotation
+//   +0x26   i16       rot2_y_fixed  Euler Y                    overridden per-slot
+//   +0x28   i16       rot2_z_fixed  Euler Z                    by animation tracks
+//   +0x2A..0x33       (10 bytes: scale always 1.0, then 4 zero bytes)
 //   +0x34   f32       local_x       position relative to parent
 //   +0x38   f32       local_y
 //   +0x3C   f32       local_z
@@ -23,10 +29,13 @@
 // Entry stride = 64 bytes.
 //
 // World positions are computed with Blender's BONESPACE algorithm:
-//   world_pos = transpose(parent_world_rot) * local_pos + parent_world_pos
-//   world_rot = local_rot * parent_world_rot
+//   world_pos = parent_world_rot * local_pos + parent_world_pos
+//   world_rot = parent_world_rot * (E(rot1) * E(rot2))
 //
-// where local_rot = Euler(rx,ry,rz).toMatrix() using XYZ order (Rz*Ry*Rx).
+// where E(rx,ry,rz).toMatrix() uses XYZ order (Rz*Ry*Rx). The bone's effective
+// local rotation is the composition E(rot1) * E(rot2). Animation tracks (NMTN)
+// override per-slot values of rot2; when a slot has neither channel nor static
+// in NMTN, the default for that slot is the rot2 value from this struct.
 
 struct Bone {
     std::string  name;
@@ -36,9 +45,12 @@ struct Bone {
     uint16_t     flags;         // 96=rigid, 355/353=dynamic chain, 361=effector
 
     // Raw local bind-pose data from file
-    float        rot_x;         // Euler X, radians
-    float        rot_y;         // Euler Y, radians
-    float        rot_z;         // Euler Z, radians
+    float        rot_x;         // rot1 Euler X, radians
+    float        rot_y;         // rot1 Euler Y, radians
+    float        rot_z;         // rot1 Euler Z, radians
+    float        rot2_x;        // rot2 Euler X, radians (secondary, animation default)
+    float        rot2_y;        // rot2 Euler Y, radians
+    float        rot2_z;        // rot2 Euler Z, radians
     float        local_x;       // local position
     float        local_y;
     float        local_z;

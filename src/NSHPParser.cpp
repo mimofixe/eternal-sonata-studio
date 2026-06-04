@@ -67,11 +67,40 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
             v.bone_weights[2] = vd[0x0E] / 255.f; v.bone_weights[3] = vd[0x0F] / 255.f;
             v.bone_ids[0] = vd[0x10]; v.bone_ids[1] = vd[0x11];
             v.bone_ids[2] = vd[0x12]; v.bone_ids[3] = vd[0x13];
+
+            // "Placeholder bid=0" rule. Some vertices in skinned meshes carry an
+            // incomplete-rigging signature where the weight bytes are e.g.
+            // [0, 16, 2, 0] and bone_ids are [0, 0, X, Y] — total sum ~18/255=0.07.
+            // After shader normalization these end up 89% on bone_id_list[0] (e.g.,
+            // Jhip/JsebC/Jhead) and only 11% on the real bone X — producing severe
+            // spike artifacts on feet, hands, and other extremities during animation
+            // (vertices orbit the placeholder bone instead of following the intended
+            // chain). The fix: any vertex whose total weight is anomalously low
+            // (< 0.5) has its bid=0 slots zeroed, redirecting all weight to the
+            // real bones. Vertices with sum >= 0.5 (normal rigging) are unchanged,
+            // so meshes that legitimately reference bone_id_list[0] (e.g., a weapon
+            // with all vertices on Jsword at bid=0) keep working as before.
+            float sum_w = v.bone_weights[0] + v.bone_weights[1]
+                + v.bone_weights[2] + v.bone_weights[3];
+            if (sum_w < 0.5f) {
+                float adj[4]; float adj_sum = 0.f;
+                for (int k = 0; k < 4; k++) {
+                    adj[k] = (v.bone_ids[k] == 0) ? 0.f : v.bone_weights[k];
+                    adj_sum += adj[k];
+                }
+                // Safety: only apply if zeroing leaves at least one real bone.
+                // (Vertices where every slot has bid=0 are extremely rare; for
+                // those, keep the original weights so the vertex still renders.)
+                if (adj_sum > 1e-6f) {
+                    for (int k = 0; k < 4; k++) v.bone_weights[k] = adj[k];
+                }
+            }
             float nx = int8_t(vd[0x14]) / 127.f, ny = int8_t(vd[0x15]) / 127.f, nz = int8_t(vd[0x16]) / 127.f;
             float m2 = nx * nx + ny * ny + nz * nz;
             if (m2 > 0.5f && m2 < 2.0f) { v.normal[0] = nx; v.normal[1] = ny; v.normal[2] = nz; }
-            v.uv[0] = HalfToFloat(ReadU16BE(vd + 0x1C));
-            v.uv[1] = HalfToFloat(ReadU16BE(vd + 0x1E));
+            const int uvoff = stride - 4;   // skinned UV = f16 pair in the last 4 bytes (0x1C@stride32, 0x18@stride28)
+            v.uv[0] = HalfToFloat(ReadU16BE(vd + uvoff));
+            v.uv[1] = HalfToFloat(ReadU16BE(vd + uvoff + 2));
         }
         else if (stride == 16) {
             // position only
@@ -97,8 +126,8 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
             //             f16 at +0x14/+0x16 = mostly sentinel 0x5555/0x55FF, not UV.
             //             UV range is typically [-1..14], tiling freely with GL_REPEAT.
             // stride=20/48: UV = i16/32767 at +0x10/+0x12.
-            if (stride == 24) {
-                // Stride-24: UV is always the f16 pair at +0x14/+0x16.
+            if (stride == 24 || stride == 32) {
+                // Stride-24/32: UV is the f16 pair at +0x14/+0x16 (map terrain like zimen019).
                 // The i16 at +0x10/+0x12 is not a UV component.
                 v.uv[0] = HalfToFloat(ReadU16BE(vd + 0x14));
                 v.uv[1] = HalfToFloat(ReadU16BE(vd + 0x16));
@@ -202,24 +231,30 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
 
 bool NSHPParser::TrySequential(const uint8_t* data, size_t chunk_end,
     size_t vdata_start, uint16_t vc, NSHPMesh& out) {
-    constexpr int SEQ_STRIDE = 48;
-    const size_t footer_start = vdata_start + size_t(vc) * SEQ_STRIDE;
-    if (footer_start + 12 != chunk_end) return false;
-    if (ReadU16BE(data + footer_start + 4) != vc) return false;
-    if (ReadU16BE(data + footer_start + 6) != 0) return false;
-    if (ReadU16BE(data + footer_start + 8) != 0) return false;
-    if (ReadU16BE(data + footer_start + 10) != 0) return false;
-    const float px = ReadF32BE(data + vdata_start);
-    if (std::isnan(px) || std::isinf(px) || std::abs(px) > 10000.f) return false;
-    DecodeVertices(data, vdata_start, vc, SEQ_STRIDE, false, out);
-    out.vertex_stride = SEQ_STRIDE;
-    out.draw_sequential = true;
-    FaceSection fs;
-    fs.mat_id = ReadU16BE(data + footer_start);
-    fs.index_start = 0;
-    fs.index_count = 0;
-    out.faceSections.push_back(fs);
-    return true;
+    // Sequential (draw-arrays) meshes have no index buffer; a 12-byte footer
+    // follows the vertices: mat_id@+0, count@+4 (==vc), zeros@+6/+8/+10.
+    // Stride is usually 48, but small billboards/props (e.g. pCube*, clover
+    // "sirotume") use stride 24.
+    for (int SEQ_STRIDE : { 48, 24 }) {
+        const size_t footer_start = vdata_start + size_t(vc) * SEQ_STRIDE;
+        if (footer_start + 12 != chunk_end) continue;
+        if (ReadU16BE(data + footer_start + 4) != vc) continue;
+        if (ReadU16BE(data + footer_start + 6) != 0) continue;
+        if (ReadU16BE(data + footer_start + 8) != 0) continue;
+        if (ReadU16BE(data + footer_start + 10) != 0) continue;
+        const float px = ReadF32BE(data + vdata_start);
+        if (std::isnan(px) || std::isinf(px) || std::abs(px) > 10000.f) continue;
+        DecodeVertices(data, vdata_start, vc, SEQ_STRIDE, false, out);
+        out.vertex_stride = SEQ_STRIDE;
+        out.draw_sequential = true;
+        FaceSection fs;
+        fs.mat_id = ReadU16BE(data + footer_start);
+        fs.index_start = 0;
+        fs.index_count = 0;
+        out.faceSections.push_back(fs);
+        return true;
+    }
+    return false;
 }
 
 bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
@@ -251,11 +286,16 @@ bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
     out.faceSections.clear();
     bool parsed = false;
     if (out.has_bones) {
-        parsed = TryStride(data, chunk_end, vdata_base, out.vertex_count,
-            out.face_section_count, 32, out);
-        if (parsed) {
-            DecodeVertices(data, vdata_base, out.vertex_count, 32, true, out);
-            out.vertex_stride = 32;
+        // Skinned meshes are usually stride 32, but some (e.g. rope/cord "himo",
+        // polySurface) are stride 28. Try both; UV sits in the last 4 bytes.
+        for (int sst : { 32, 28 }) {
+            if (TryStride(data, chunk_end, vdata_base, out.vertex_count,
+                out.face_section_count, sst, out)) {
+                DecodeVertices(data, vdata_base, out.vertex_count, sst, true, out);
+                out.vertex_stride = sst;
+                parsed = true;
+                break;
+            }
         }
     }
     else {
@@ -272,7 +312,7 @@ bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
         }
         const size_t vstart_a = vdata_base;
         const size_t vstart_b = vdata_base + 32;
-        const int STATIC_STRIDES[] = { 24, 28, 20, 16, 0 };
+        const int STATIC_STRIDES[] = { 24, 28, 32, 20, 16, 0 };
         auto try_pos = [&](size_t vstart) -> bool {
             if (TrySequential(data, chunk_end, vstart, out.vertex_count, out)) return true;
             for (const int* sp = STATIC_STRIDES; *sp; ++sp)

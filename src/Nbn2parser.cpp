@@ -80,9 +80,12 @@ bool NBN2Parser::Parse(const uint8_t* data, size_t size, std::vector<Bone>& out)
         bone.parent_idx = ReadI16BE(b + 0x12);
         bone.child_idx = ReadI16BE(b + 0x14);
         bone.sibling_idx = ReadI16BE(b + 0x16);
-        bone.rot_x = ReadI16BE(b + 0x18) / 4096.0f;  // i16 → radians
+        bone.rot_x = ReadI16BE(b + 0x18) / 4096.0f;  // rot1: i16 → radians
         bone.rot_y = ReadI16BE(b + 0x1A) / 4096.0f;
         bone.rot_z = ReadI16BE(b + 0x1C) / 4096.0f;
+        bone.rot2_x = ReadI16BE(b + 0x24) / 4096.0f;  // rot2: secondary rotation
+        bone.rot2_y = ReadI16BE(b + 0x26) / 4096.0f;
+        bone.rot2_z = ReadI16BE(b + 0x28) / 4096.0f;
         bone.local_x = ReadF32BE(b + 0x34);
         bone.local_y = ReadF32BE(b + 0x38);
         bone.local_z = ReadF32BE(b + 0x3C);
@@ -115,7 +118,12 @@ void NBN2Parser::ComputeWorldPositions(std::vector<Bone>& bones) {
         Bone& bone = bones[i];
 
         glm::vec3 lp(bone.local_x, bone.local_y, bone.local_z);
-        glm::mat3 lr = EulerXYZ(bone.rot_x, bone.rot_y, bone.rot_z);
+        // Local rotation is the composition of rot1 and rot2. Validated against
+        // pcalg sword bind position: Jsword bind world with rot1*rot2 matches
+        // the weapon mesh center exactly. With rot1 only, the sword is offset.
+        glm::mat3 r1 = EulerXYZ(bone.rot_x, bone.rot_y, bone.rot_z);
+        glm::mat3 r2 = EulerXYZ(bone.rot2_x, bone.rot2_y, bone.rot2_z);
+        glm::mat3 lr = r1 * r2;
 
         const int par = bone.parent_idx;
         if (par < 0 || par >= static_cast<int>(bones.size())) {

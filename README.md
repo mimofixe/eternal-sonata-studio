@@ -61,6 +61,7 @@ Xbox 360 retail files use a proprietary tri-Crescendo (Tcx) compression format. 
 - NSHP mesh format parser - complete rewrite with all five vertex strides confirmed
 - Restart-aware tristrip decoding (`0xFFFF` primitive restart tokens handled correctly)
 - Correct geometry rendering for map meshes (strides 16/20/24/28) and character meshes (stride 32)
+- Additional map strides covered by the detector: static terrain at stride 32 (e.g. `zimen019`), skinned rope and cord meshes at stride 28, and sequential-draw billboards at stride 24
 - 10:10:10:2 packed normal decoding for static map geometry
 - Stride-48 particle meshes rendered as GL_POINTS (billboard particle systems)
 - OpenGL 4.5 rendering with camera controls (orbit, pan, zoom) and auto-fit on load
@@ -94,18 +95,15 @@ Xbox 360 retail files use a proprietary tri-Crescendo (Tcx) compression format. 
 - "Flip Y" toggle for PS3 Y-down to OpenGL Y-up conversion
 - Bone list in ChunkInspector shows all bones inline with Euler angles, local positions, and type colour-coding (dynamic chains in blue, effectors in green)
 
-### Animation Viewport (work in progress, output is wrong)
+### Animation Viewport
 
-`.e` character files contain NBN2 skeletons, NSHP skinned meshes, and NMTN animation tracks. The Animation Viewport ties them together: it locates the skinned NSHP inside the NMDL envelope, builds the inverse-bind matrices, and applies NMTN keyframe deltas on top of the NBN2 bind pose every frame.
+`.e` character files and `.bmd` party archives contain NBN2 skeletons, NSHP skinned meshes, and NMTN animation tracks. The Animation Viewport ties them together: it locates the skinned NSHP inside the NMDL envelope, builds the inverse-bind matrices, and applies the NMTN keyframe channels on top of the NBN2 bind pose every frame.
 
 UI: animation selector, play/pause, frame slider with frame count display, FPS slider, skeleton overlay toggle. The viewport is offscreen-rendered to an ImGui-embedded texture so it composes inside the docking layout.
 
-**The animation result is currently incorrect.** Two known issues:
+The NMTN format is now decoded from the Xbox 360 executable, so the motion plays correctly. Each track carries nine channel slots (position XYZ, rotation XYZ, scale XYZ); each slot is inactive, a single static value, or a keyframed channel. Keyframes are interpolated with cubic Hermite using their stored tangents, position channels override the bone local position, and rotation channels compose as `Euler(bind) * Euler(anim)` in the bone-local frame. Three rotation correctness passes run at parse time: Euler antipodal flip detection, per-axis wraparound unwrapping, and a tangent rebuild that removes Hermite overshoot. See the NMTN Chunks and Animation Pipeline sections for detail.
 
-1. **Channel routing is a guess.** NMTN tracks store three channels (`c0/c1/c2`). For translation bones the parser maps `c0 -> dx (lateral)`, `c2 -> dy (vertical)` and skips `c1` (root motion forward). For rotation bones it maps `c0 -> ry`, `c1 -> rx`, `c2 -> rz`. These mappings were inferred from a few test files and are wrong for many bones — limbs end up rotating around the wrong axis.
-2. **No bezier tangent handling.** NMTN Format-A tracks include tangent data after each keyframe; the parser drops the tangents and treats keys as linear-interpolated. Smooth ease-in/ease-out motions come out as straight ramps.
-
-The viewport is shipped as-is for debugging the format. Don't use it for asset extraction yet.
+`.bmd` party archives such as `appkeep2.bmd` expose each NOBJ as a selectable model with its own skeleton and animation set. Files that ship NMTN tracks with no NBN2 (shared field-event banks for door and chest interactions) are parsed as a skeleton-less animation list, so the motions are surfaced even though there is no rig in the file to pose.
 
 ### AI Behaviour Scripts
 
@@ -183,6 +181,8 @@ Archives containing multiple texture chunks. `.p3tex` (PS3) holds NTX3 chunks; `
 
 All indexed formats use restartable tristrips with `0xFFFF` as the primitive restart token.
 
+Stride is not stored; the parser detects it by validating each candidate against the file layout. Beyond the canonical assignments above, some maps reuse the same byte layouts with a different stride: static terrain meshes can use stride 32 (UV is the f16 pair at `+0x14`), skinned rope and cord meshes can use stride 28 (UV is the f16 pair in the last four bytes), and sequential-draw billboards can use stride 24 as well as 48. The detector tries all of these.
+
 ### NMDL Chunks
 
 Top-level model container. Contains all NSHP meshes, NTX3 textures and the NMTR material table for one model. Map models carry no embedded NTX3; textures come from a companion `.p3tex` archive loaded separately. Sub-chunks are found by byte-scanning within the NMDL size boundary.
@@ -197,7 +197,11 @@ Material definitions, 96 bytes per entry. `w[5]==1` at the first 8xu16 block ind
 
 ### NMTN Chunks
 
-Animation tracks. Each animation has a name, a frame count, and a list of per-bone tracks. Two storage formats (A and BC) coexist; both decode into the same `NMTNTrack { is_translation, is_static, rx/ry/rz channels }` runtime structure. The channel routing into Euler XYZ deltas is the part still being verified -- see the Animation Viewport caveats.
+Animation tracks. Each animation has a name, a frame count, and a list of per-bone tracks. One track is one bone: a 16-byte name, the track size at `+0x10`, and a `u32` flag word at `+0x14` holding nine 3-bit fields (one per channel slot, read as `(flags >> ((8 - slot) * 3)) & 7`). Field 0 is inactive, field 1 is a single static value held in the preamble, field 2 is a keyframed channel. Slots 0 to 2 are position XYZ, slots 3 to 5 are rotation XYZ, slots 6 to 8 are scale XYZ. The preamble holds one `f32` per static slot in slot order, followed by one channel per keyframed slot.
+
+Each channel is a `u16` keyframe count, an exponent byte `fmt` in the range `0x0C` to `0x0F`, then `count` eight-byte keyframes: frame (`u16`), value (`i16`), incoming tangent (`i16`), outgoing tangent (`i16`). Value and tangents are scaled by `1.0 / (1 << fmt)`, giving radians for rotation and local units for position. Keyframes are interpolated with cubic Hermite from the stored tangents. The layout was reverse-engineered from the Xbox 360 executable (channel init `0x8211cc18`, value sampler `0x8211ccc8`, channel binding `0x8211b720`).
+
+Rotation channels get three correctness passes at parse time: antipodal Euler flip detection (`E(a,b,c)` equals `E(a-pi, pi-b, c-pi)`), per-axis unwrap when a channel crosses plus or minus pi, and a tangent rebuild from the corrected values to stop cubic Hermite overshoot.
 
 ### NLIT Chunks
 
@@ -245,8 +249,8 @@ eternal-sonata-studio/
 
 ## Known Limitations
 
-- Animation playback is implemented but produces incorrect motion -- channel-to-axis routing and bezier tangent handling still need work
 - Skinned mesh vertex normals are not yet decoded correctly; geometric normals are used as a workaround in the viewer
+- One sequential mesh variant is still unparsed: a multi-section sequential draw at stride 24 (the dandelion fluff `watage_ten`)
 - NTX2 DXT5 and RGBA8 paths are present but not exhaustively tested
 - Material export not available
 
@@ -295,9 +299,11 @@ NBN2 bones are rendered in two passes: yellow `GL_LINES` from parent to child (d
 
 ### Animation Pipeline
 
-The AnimViewport ties NBN2, the skinned NSHP inside the NMDL envelope, and NMTN tracks together. Each frame it copies the bind pose, walks every track's `NMTNChannel::Sample(t)` (linear interpolation between keyframes), adds the resulting deltas into the Euler / position fields of the corresponding bone, then re-runs `NBN2Parser::ComputeWorldPositions` to refresh world matrices. Skinning matrices `world * inv_bind` are uploaded per draw as a `mat4` array uniform; the vertex shader does the standard four-weight blend.
+The AnimViewport ties NBN2, the skinned NSHP inside the NMDL envelope, and NMTN tracks together. Each frame it copies the bind pose, samples every track channel with `NMTNChannel::Sample(t)` (cubic Hermite from the stored tangents), writes position channels over the bone local position and composes rotation channels as `Euler(bind) * Euler(anim)`, then re-runs `NBN2Parser::ComputeWorldPositions` to refresh world matrices. Skinning matrices `world * inv_bind` are uploaded per draw as a `mat4` array uniform; the vertex shader does the standard four-weight blend.
 
-The pose application is correct in *shape*; the part that's wrong is which NMTN channel feeds which bone axis. Format-A tracks also carry bezier tangents that are currently dropped, so smooth easing comes out as a piecewise-linear ramp. Both issues are isolated to `NMTNParser::ParseAnimation` and `AnimViewport::ApplyPose`.
+Channel routing is no longer a guess: the nine 3-bit slot fields name each channel directly (position XYZ, rotation XYZ, scale XYZ). The tangents are read and used, so smooth easing is reproduced rather than flattened to a ramp. Rotation channels are corrected for antipodal Euler flips and for wraparound past plus or minus pi, and their tangents are rebuilt from the corrected values, which removes the per-frame tweak and tremble artifacts. The remaining animation work is in skinned vertex normals, which the viewer still substitutes with geometric normals.
+
+`.bmd` party archives feed the viewport through the same path as `.e` files, and each NOBJ becomes its own model. Archives that contain NMTN tracks but no NBN2 are parsed as a skeleton-less animation list so the motions are not dropped.
 
 ### Scene Lighting
 

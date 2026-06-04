@@ -499,6 +499,7 @@ ChunkType ContainerParser::GetChunkTypeFromMagic(uint32_t magic) {
     if (magic == MAGIC_NOBJ) return ChunkType::NOBJ;
     if (magic == MAGIC_NMDL) return ChunkType::NMDL;
     if (magic == MAGIC_NMTN) return ChunkType::NMTN;
+    if (magic == MAGIC_NBN2) return ChunkType::NBN2;
     if (magic == MAGIC_NCAM) return ChunkType::NCAM;
     if (magic == MAGIC_NMTR) return ChunkType::NMTR;
     if (magic == MAGIC_NLIT) return ChunkType::NLIT;

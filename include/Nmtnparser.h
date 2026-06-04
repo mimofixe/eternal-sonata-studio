@@ -4,81 +4,72 @@
 #include <cstdint>
 #include <unordered_map>
 
-//  NMTN Animation Format — Eternal Sonata PS3 (verified against pcalg_v1.p3obj)
+// NMTN Animation Format - Eternal Sonata (PS3/Xbox360)
+// Reverse-engineered from Xbox360 EBOOT.BIN (decrypted XEX):
+//   - Channel init:    fn 0x8211cc18  -> value_scale = 1.0/(1<<fmt_byte)
+//   - Value sampler:   fn 0x8211ccc8  (Hermite with tangents)
+//   - Euler->matrix:   fn 0x82117b70 -> 0x820c0668 (sin/cos polynomial)
+//   - Channel binding: fn 0x8211b720  (flags -> per-slot fields)
 //
-//  TRACK LAYOUT:
-//    +0x00  char[16]   bone name (null-padded)
-//    +0x10  u32 BE     total track size
-//    +0x14  u32 BE     flags
-//    +0x18  variable   preamble: 0/4/8/12 bytes of f32 BE values
-//                      = bind-pose local position (lx, ly, lz) with any
-//                        component that is exactly 0 omitted.
-//                      Redundant copy of NBN2 data — useful for sanity check.
-//    +0x..  variable   N channels CONTIGUOUS (N = 1, 2, or 3)
+// TRACK LAYOUT (one per bone):
+//   +0x00  char[16]   bone name
+//   +0x10  u32 BE     track size
+//   +0x14  u32 BE     flags: 9 slots * 3 bits each, field = (flags>>((8-slot)*3))&7
+//                            field 0 = inactive, 1 = static (preamble),
+//                            2 = keyframed channel
+//   +0x18  N*f32 BE   preamble: one f32 per static slot, in slot order
+//   ...    channels:  one per keyframed slot, in slot order
 //
-//  CHANNEL LAYOUT:
-//    +0x00  u16 BE     keyframe count
-//    +0x02  u16 BE     format flag (always 0x000F seen)
-//    +0x04  N*8 bytes  N keyframes
+// SLOTS:  0,1,2 = posX/Y/Z   3,4,5 = rotX/Y/Z   6,7,8 = sclX/Y/Z
 //
-//  KEYFRAME (8 bytes):
-//    +0x00  u16 BE     frame number
-//    +0x02  i16 BE     value
-//    +0x04  4 bytes    tangent / reserved (always 0 in tested files —
-//                      bezier tangents probably unused in this dataset)
+// CHANNEL LAYOUT:
+//   +0x00  u16 BE     keyframe count
+//   +0x02  u8         (high byte of fmt, 0)
+//   +0x03  u8         fmt byte (0x0C..0x0F) -> value_scale = 1.0/(1<<fmt)
+//   +0x04  count*8    keyframes
 //
-//  INTERPRETATION  (verified by loop check + visual confirmation):
+// KEYFRAME (8 bytes):
+//   +0x00  u16 BE     frame number
+//   +0x02  i16 BE     value          (* scale = radians for rot, units for pos)
+//   +0x04  i16 BE     tan_in         (* scale, slope at this kf coming in)
+//   +0x06  i16 BE     tan_out        (* scale, slope going out)
 //
-//    Translation bones (move / pos / Top1):
-//        c0 → local x      ABSOLUTE position (overrides bind)
-//        c1 → local y      ABSOLUTE
-//        c2 → local z      ABSOLUTE
-//        scale = 1 / 32768
-//
-//    Rotation bones (everything else, when 3 channels present):
-//        (c0, c1, c2) → quaternion (qx, qy, qz), scale 1/32768
-//        qw = sqrt(max(0, 1 - qx² - qy² - qz²))   ← reconstructed (smallest-three)
-//        applied as DELTA against bind rotation:
-//            local_rot = bind_local_rot * quat_to_mat(qx, qy, qz, qw)
-//
-//    Rotation bones with 1 or 2 channels: not yet decoded.
-//        The flags field at +0x14 of the track header probably encodes which
-//        axis/axes are present. For now these bones stay in bind pose.
-//
-//  WHY i16/32768 AND NOT i16*pi/32768?
-//    Because the channels are quaternion components, not Euler angles.
-//    Quaternion (x, y, z) components must lie in [-1, 1]; an i16 / 32768
-//    maps i16 [-32768, 32767] to roughly [-1, 1).
-//
-//  LOOP PROPERTY:
-//    Every channel satisfies value[0] == value[count-1].
-//    Frame 0 and frame (count-1) are identical, so the animation seamlessly loops.
-
-static constexpr float kNMTNScale = 1.0f / 32768.0f;   // both rotation and translation
-
-inline bool NMTNIsTranslationBone(const std::string& name) {
-    return name == "move" || name == "pos" || name == "Top1";
-}
+// APPLICATION:
+//   pos: channel value overrides bind local position
+//   rot: local_rot = Euler(bind) * Euler(anim)  (anim in bone-local frame)
+//   scale: (similar to pos, applies to bind scale)
 
 struct NMTNKeyframe {
     uint16_t frame;
-    float    value;     // already scaled (multiplied by kNMTNScale)
+    float    value;     // already scaled to radians (or position units)
+    float    tan_in;    // already scaled
+    float    tan_out;
 };
 
 struct NMTNChannel {
     std::vector<NMTNKeyframe> keys;
     bool Empty() const { return keys.empty(); }
 
-    // Linear interpolation. `base` is returned for empty channels.
-    float Sample(float t, float base = 0.f) const {
-        if (keys.empty()) return base;
+    // Cubic Hermite interpolation using stored tangents.
+    float Sample(float t) const {
+        if (keys.empty()) return 0.f;
         if (t <= keys.front().frame) return keys.front().value;
         if (t >= keys.back().frame)  return keys.back().value;
         for (size_t i = 0; i + 1 < keys.size(); ++i) {
-            float f0 = keys[i].frame, f1 = keys[i + 1].frame;
-            if (t >= f0 && t <= f1) {
-                float a = (f1 > f0) ? (t - f0) / (f1 - f0) : 0.f;
-                return keys[i].value + a * (keys[i + 1].value - keys[i].value);
+            const auto& k0 = keys[i];
+            const auto& k1 = keys[i + 1];
+            if (t >= k0.frame && t <= k1.frame) {
+                float dt = float(k1.frame) - float(k0.frame);
+                if (dt <= 0.f) return k0.value;
+                float s = (t - k0.frame) / dt;
+                float m0 = k0.tan_out * dt;
+                float m1 = k1.tan_in * dt;
+                float s2 = s * s, s3 = s2 * s;
+                float h00 = 2 * s3 - 3 * s2 + 1;
+                float h10 = s3 - 2 * s2 + s;
+                float h01 = -2 * s3 + 3 * s2;
+                float h11 = s3 - s2;
+                return h00 * k0.value + h10 * m0 + h01 * k1.value + h11 * m1;
             }
         }
         return keys.back().value;
@@ -87,18 +78,21 @@ struct NMTNChannel {
 
 struct NMTNTrack {
     std::string  bone_name;
-    bool         is_translation = false;
-    bool         is_static = false;       // no channels parsed
+    uint32_t     flags = 0;
 
-    int          channel_count = 0;       // 0, 1, 2, or 3
-    NMTNChannel  c0;
-    NMTNChannel  c1;
-    NMTNChannel  c2;
+    // For each of the 9 slots: field value from flags (0/1/2).
+    uint8_t      field[9] = { 0,0,0,0,0,0,0,0,0 };
 
-    // Preamble (bind-pose position floats from track header).
-    // Mostly for debugging — the actual bind position comes from NBN2.
-    int   preamble_count = 0;
-    float preamble[3] = { 0.f, 0.f, 0.f };
+    // Static slot values (from preamble) when field[slot] == 1.
+    float        static_val[9] = { 0,0,0,0,0,0,0,0,0 };
+
+    // Keyframed channels when field[slot] == 2.
+    NMTNChannel  channel[9];
+
+    bool HasChannel(int slot) const { return field[slot] == 2 && !channel[slot].Empty(); }
+    bool HasStatic(int slot) const { return field[slot] == 1; }
+    bool HasAnyRot() const { return HasChannel(3) || HasChannel(4) || HasChannel(5); }
+    bool HasAnyPos() const { return HasChannel(0) || HasChannel(1) || HasChannel(2); }
 };
 
 struct NMTNAnimation {
@@ -127,6 +121,4 @@ private:
     static float    F32(const uint8_t* d);
 
     static void ParseTrack(const uint8_t* t, uint32_t t_size, NMTNTrack& out);
-    static bool ParseChannel(const uint8_t* p, uint32_t remaining,
-        NMTNChannel& out, uint32_t& consumed);
 };
