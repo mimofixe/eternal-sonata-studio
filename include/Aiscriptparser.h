@@ -120,7 +120,7 @@ struct AIScriptFile {
     std::vector<uint32_t>      node_offsets;
     std::vector<AINode>        nodes;
     std::vector<AIApiEntry>    api_catalog;
-    std::vector<AIActionEntry> action_table;   
+    std::vector<AIActionEntry> action_table;
 
     uint32_t special_ability_api = 0;  // Group A: special ability address (simple files)
     uint32_t main_loop_node = 0;  // index of the largest node (main AI loop ~9KB)
@@ -130,6 +130,12 @@ struct AIScriptFile {
 
     // API addresses sorted by call count (descending)
     std::vector<uint32_t> unique_apis_sorted;
+
+    // bytes crus da tabela de strings (entre fim-do-bytecode e marker 0x447A).
+    // Offset 0 = first string.
+    std::vector<uint8_t> string_table_raw;
+
+    std::map<uint32_t, std::string> string_refs;
 };
 
 class AIScriptParser {
@@ -162,5 +168,6 @@ private:
     static void DisasmNodes(AIScriptFile& f);
     static void BuildApiCatalog(AIScriptFile& f);
     static void DecodeActionTable(AIScriptFile& f);
+    static void AnnotateStringRefs(AIScriptFile& f);
     static void FindKeyNodes(AIScriptFile& f);
 };

@@ -14,6 +14,7 @@
 #include "TEXParser.h"
 #include "AIScriptParser.h"
 #include "AIScriptViewer.h"
+#include "Cutsceneviewport.h"
 #include "TutorialParser.h"
 #include "TutorialViewer.h"
 #include "FileDialog.h"
@@ -27,6 +28,7 @@
 #include "CSFViewer.h"
 #include "AnimViewport.h"
 #include "TcxDecompressor.h"
+#include "Fntviewer.h"
 
 Application::Application(const AppConfig& config)
     : m_Config(config), m_Running(false) {
@@ -87,7 +89,9 @@ void Application::Run() {
     CSFViewer csf_viewer;
     AIScriptViewer ai_script_viewer;
     TutorialViewer tutorial_viewer;
+    CutsceneViewport cutscene_viewport;
     AnimViewport   anim_viewport;
+    FntViewer      fnt_viewer;
 
     chunk_inspector.SetViewport(&viewport);
     chunk_inspector.SetP3TexParser(&m_P3TexParser);
@@ -217,8 +221,47 @@ void Application::Run() {
         tutorial_viewer.Render();
         ImGui::End();
 
+        ImGui::Begin("Cutscene Script (Stage 0)");
+        cutscene_viewport.Render();
+        ImGui::End();
+
         ImGui::Begin("Animation Viewport");
         anim_viewport.Render();
+        ImGui::End();
+
+        ImGui::Begin("Font Loader (.fnt / FONT block)");
+        if (ImGui::Button("Load Font...", ImVec2(220, 0))) {
+            std::string path = FileDialog::OpenFile(
+                "Font / any file\0*.fnt;*.bmd;*.*\0FNT Fonts\0*.fnt\0All Files\0*.*\0");
+            if (!path.empty()) {
+                // A .fnt loads directly; for any other file the parser scans for
+                // an embedded FONT block, so a BMD (or anything carrying a font)
+                // can be opened here too.
+                bool comp = false;
+                std::string load_path = resolveDecompressedPath(path, &comp);
+                if (!fnt_viewer.LoadFile(load_path))
+                    fnt_viewer.Clear();
+            }
+        }
+        if (fnt_viewer.IsLoaded()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "✓ Loaded");
+            ImGui::Text("File: %s", fnt_viewer.GetFilename().c_str());
+            ImGui::TextWrapped("Type text with the on-screen keyboard in the "
+                "'Font Viewer' window.");
+            if (ImGui::Button("Clear", ImVec2(100, 0)))
+                fnt_viewer.Clear();
+        }
+        else {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Not loaded");
+            ImGui::TextWrapped("Load a .fnt font, or any file that contains a "
+                "FONT block (it will be found automatically).");
+        }
+        ImGui::End();
+
+        ImGui::Begin("Font Viewer (write with .fnt)");
+        fnt_viewer.Render();
         ImGui::End();
 
         ImGui::Begin("File Browser");
@@ -327,6 +370,15 @@ void Application::Run() {
                         text_extractor.LoadFromFile(current_file_data);
                         csf_viewer.SetFileContext(current_file_data, loaded_chunks);
                         anim_viewport.LoadFromChunks(current_file_data, loaded_chunks);
+
+                        // Stage 0: if it's a .e with the script magic (evdata cutscene),
+                        // disassemble the scene script. Additive: does not affect other viewers.
+                        if (extension == ".e" &&
+                            CutsceneScriptParser::IsCutscene(
+                                current_file_data.data(), current_file_data.size()))
+                            cutscene_viewport.Load(effective_path);
+                        else
+                            cutscene_viewport.Clear();
                     }
                 }
                 else if (extension == ".ep3") {
@@ -376,6 +428,12 @@ void Application::Run() {
                     // through the same path as the dedicated Load button.
                     m_P3TexParser.Load(effective_path);
                     tex_viewer.SetParser(&m_P3TexParser);
+                }
+                else if (extension == ".fnt") {
+                    // Bitmap font selected from the browser: route through the
+                    // same path as the dedicated Load Font button.
+                    if (!fnt_viewer.LoadFile(effective_path))
+                        fnt_viewer.Clear();
                 }
             }
         }

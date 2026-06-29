@@ -304,40 +304,41 @@ void NMTNParser::ParseTrack(const uint8_t* t, uint32_t t_size, NMTNTrack& out) {
 
     uint32_t pos = 0x18;
 
-    // Preamble: one f32 per static slot, in slot order.
+    // Slot entries are interleaved in slot order: for each slot 0..8, a static
+    // slot is one f32 and a channel slot is a channel block, in whatever order
+    // the slots fall. Statics and channels are NOT grouped, so walk slots in
+    // order and dispatch on the field (single pass).
     for (int s = 0; s < 9; ++s) {
-        if (out.field[s] != 1) continue;
-        if (pos + 4 > t_size) return;
-        out.static_val[s] = F32(t + pos);
-        pos += 4;
-    }
-
-    // Channels: one per keyframed slot, in slot order.
-    for (int s = 0; s < 9; ++s) {
-        if (out.field[s] != 2) continue;
-        if (pos + 4 > t_size) return;
-
-        uint16_t count = U16(t + pos);
-        uint8_t  fmt = t[pos + 3];
-        // fmt is the bit-shift exponent: scale = 1.0 / (1 << fmt)
-        if (fmt < 0x0C || fmt > 0x0F)         return;  // unsupported
-        if (count == 0 || count > 1000)       return;
-        uint32_t need = 4u + (uint32_t)count * 8u;
-        if (pos + need > t_size)              return;
-
-        const float scale = 1.0f / float(1u << fmt);
-        out.channel[s].keys.clear();
-        out.channel[s].keys.reserve(count);
-        for (uint16_t k = 0; k < count; ++k) {
-            const uint8_t* kf = t + pos + 4 + k * 8;
-            NMTNKeyframe kfo;
-            kfo.frame = U16(kf);
-            kfo.value = (float)I16(kf + 2) * scale;
-            kfo.tan_in = (float)I16(kf + 4) * scale;
-            kfo.tan_out = (float)I16(kf + 6) * scale;
-            out.channel[s].keys.push_back(kfo);
+        if (out.field[s] == 1) {            // static: one f32
+            if (pos + 4 > t_size) return;
+            out.static_val[s] = F32(t + pos);
+            pos += 4;
         }
-        pos += need;
+        else if (out.field[s] == 2) {     // channel: count/fmt/keyframes
+            if (pos + 4 > t_size) return;
+
+            uint16_t count = U16(t + pos);
+            uint8_t  fmt = t[pos + 3];
+            // fmt is the bit-shift exponent: scale = 1.0 / (1 << fmt)
+            if (fmt < 0x0C || fmt > 0x0F)         return;  // unsupported
+            if (count == 0 || count > 1000)       return;
+            uint32_t need = 4u + (uint32_t)count * 8u;
+            if (pos + need > t_size)              return;
+
+            const float scale = 1.0f / float(1u << fmt);
+            out.channel[s].keys.clear();
+            out.channel[s].keys.reserve(count);
+            for (uint16_t k = 0; k < count; ++k) {
+                const uint8_t* kf = t + pos + 4 + k * 8;
+                NMTNKeyframe kfo;
+                kfo.frame = U16(kf);
+                kfo.value = (float)I16(kf + 2) * scale;
+                kfo.tan_in = (float)I16(kf + 4) * scale;
+                kfo.tan_out = (float)I16(kf + 6) * scale;
+                out.channel[s].keys.push_back(kfo);
+            }
+            pos += need;
+        }
     }
 
     // POST-PROCESS rotation channels (slots 3,4,5) to fix two interpolation

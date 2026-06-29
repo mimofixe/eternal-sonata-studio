@@ -10,6 +10,7 @@
 #include "NBN2Parser.h"
 #include "Camera.h"
 #include "Shader.h"
+#include "Cutscenescriptparser.h"
 
 // GPU resources for one mesh within an NMDL model.
 struct MeshGPUData {
@@ -44,6 +45,12 @@ public:
     bool HasSkeleton() const { return m_HasSkeleton; }
 
     void Render();
+
+    // Preset cameras extracted from a map script (.e), in WORLD coordinates.
+    // These are the field's built-in dialogue/scene cameras; offering them lets the
+    // user jump the viewport to a canonical framing of the loaded map.
+    void SetMapCameras(const std::vector<CutsceneScript::CSFieldShot>& shots);
+    void ClearMapCameras();
 
     // Scene lighting from NLIT chunk.
     // ambient_rgb and dir_rgb are 0-255 byte colours from the NLIT data.
@@ -104,4 +111,7 @@ private:
 
     glm::vec2 m_LastMouse{ 0.f };
     bool      m_MouseDown = false;
+
+    // Preset map cameras (world-space eye + yaw).
+    std::vector<CutsceneScript::CSFieldShot> m_MapCameras;
 };

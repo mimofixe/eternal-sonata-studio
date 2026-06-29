@@ -70,6 +70,11 @@ add_executable(es_studio
     src/Nmtnparser.cpp
     src/Ntx2parser.cpp
     src/TcxDecompressor.cpp
+    src/Cutscenescriptparser.cpp
+    src/Cutsceneviewport.cpp
+    src/Cutscenescene.cpp
+    src/Fntviewer.cpp
+    src/Fntparser.cpp
 )
 
 target_link_libraries(es_studio PRIVATE

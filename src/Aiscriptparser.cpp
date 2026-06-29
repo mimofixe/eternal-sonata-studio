@@ -277,6 +277,175 @@ std::string AIScriptParser::ApiMeaning(uint32_t addr, int call_count, bool is_co
 //   0x6B/6C/6E/6F  — LOOPN / MODF / SETST / SETST2
 //   0x73 [1b]      — TEST #XX
 //   0x4F [1b]      — POPN #N  (pop N values from stack into globals)
+// === VM de AI: tabela de opcodes (RE do EBOOT runtime, jump table @ 0x3af380) ===
+// Stack machine. Fetch 1 byte; opcodes validos 0x00-0x89; > 0x89 ignorados pela VM.
+// Largura total = 1 (opcode) + operandos. Derivada por desmontagem dos 138 handlers.
+// Familias confirmadas em runtime: 0x81 PUSH, 0x85 POP, 0x18 LOADL, 0x7d PUSHI32, 0x00 NOP.
+static const uint8_t AI_OP_W[256] = {
+    1, 2, 3, 5, 9, 2, 3, 5, 5, 2, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 5, 2, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2,
+    2, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2, 2, 5, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 5, 1, 5,
+    2, 1, 1, 5, 2, 1, 1, 5, 2, 2, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+
+// Mnemonica por opcode. Nomes confirmados explicitos; restantes por familia (OPxx/LDxx/STxx)
+// ate' a semantica de cada handler ser confirmada individualmente.
+static const char* AI_OP_MNEM(uint8_t op) {
+    switch (op) {
+    case 0x00: return "END";
+    case 0x01: return "LDI8";
+    case 0x02: return "LDX";
+    case 0x03: return "LDX";
+    case 0x04: return "OP";
+    case 0x05: return "LDX";
+    case 0x06: return "LDX";
+    case 0x07: return "LDX";
+    case 0x08: return "LDLOCX";
+    case 0x09: return "LDLOCX";
+    case 0x0a: return "LDX";
+    case 0x0b: return "LDX";
+    case 0x0c: return "LDX";
+    case 0x0d: return "OP";
+    case 0x0e: return "LDX";
+    case 0x0f: return "LDX";
+    case 0x10: return "LDLOCX";
+    case 0x11: return "LDLOCX";
+    case 0x12: return "LDLOCX";
+    case 0x13: return "OP";
+    case 0x14: return "LDLOCX";
+    case 0x15: return "LDLOCX";
+    case 0x16: return "LDLOCX";
+    case 0x17: return "LDLOCX";
+    case 0x18: return "LDLOC";
+    case 0x19: return "OP";
+    case 0x1a: return "LDLOCX";
+    case 0x1b: return "LDLOCX";
+    case 0x1c: return "LDX";
+    case 0x1d: return "ACCOP";
+    case 0x1e: return "ACCOP";
+    case 0x1f: return "OP";
+    case 0x20: return "LDX";
+    case 0x21: return "ACCOP";
+    case 0x22: return "STK";
+    case 0x23: return "STK";
+    case 0x24: return "STK";
+    case 0x25: return "STK";
+    case 0x26: return "CALLFX";
+    case 0x27: return "CALLFX";
+    case 0x28: return "I2F";
+    case 0x29: return "I2F";
+    case 0x2a: return "I2F";
+    case 0x2b: return "I2F";
+    case 0x2c: return "F2I";
+    case 0x2d: return "OP";
+    case 0x2e: return "F2I";
+    case 0x2f: return "OP";
+    case 0x30: return "CMPI";
+    case 0x31: return "FCMP";
+    case 0x32: return "ACCOP";
+    case 0x33: return "FADD";
+    case 0x34: return "FADD";
+    case 0x35: return "ISUB";
+    case 0x36: return "FSUB";
+    case 0x37: return "FSUB";
+    case 0x38: return "IMUL";
+    case 0x39: return "IMUL";
+    case 0x3a: return "STK";
+    case 0x3b: return "STK";
+    case 0x3c: return "ACCOP";
+    case 0x3d: return "ACCOP";
+    case 0x3e: return "FDIV";
+    case 0x3f: return "FDIV";
+    case 0x40: return "IMUL";
+    case 0x41: return "IMUL";
+    case 0x42: return "ACCOP";
+    case 0x43: return "ACCOP";
+    case 0x44: return "ACCOP";
+    case 0x45: return "AND";
+    case 0x46: return "XOR";
+    case 0x47: return "OR";
+    case 0x48: return "ACCOP";
+    case 0x49: return "OP";
+    case 0x4a: return "OP";
+    case 0x4b: return "ACCOP";
+    case 0x4c: return "AND";
+    case 0x4d: return "LDX";
+    case 0x4e: return "LDX";
+    case 0x4f: return "LDX";
+    case 0x50: return "FADD";
+    case 0x51: return "FADD";
+    case 0x52: return "LDX";
+    case 0x53: return "LDX";
+    case 0x54: return "LDX";
+    case 0x55: return "LDX";
+    case 0x56: return "LDX";
+    case 0x57: return "LDX";
+    case 0x58: return "FADD";
+    case 0x59: return "FADD";
+    case 0x5a: return "LDX";
+    case 0x5b: return "LDX";
+    case 0x5c: return "LDX";
+    case 0x5d: return "ISUB";
+    case 0x5e: return "FCMP";
+    case 0x5f: return "FCMP";
+    case 0x60: return "ISUB";
+    case 0x61: return "FCMP";
+    case 0x62: return "FCMP";
+    case 0x63: return "ICMP";
+    case 0x64: return "FCMP";
+    case 0x65: return "FCMP";
+    case 0x66: return "ICMP";
+    case 0x67: return "FCMP";
+    case 0x68: return "FCMP";
+    case 0x69: return "UCMP";
+    case 0x6a: return "UCMP";
+    case 0x6b: return "ICMP";
+    case 0x6c: return "FCMP";
+    case 0x6d: return "FCMP";
+    case 0x6e: return "ICMP";
+    case 0x6f: return "FCMP";
+    case 0x70: return "FCMP";
+    case 0x71: return "UCMP";
+    case 0x72: return "UCMP";
+    case 0x73: return "CMPI";
+    case 0x74: return "OP";
+    case 0x75: return "JCMP";
+    case 0x76: return "CMPI";
+    case 0x77: return "OP";
+    case 0x78: return "CMPI";
+    case 0x79: return "CMPI";
+    case 0x7a: return "CALLNODE";
+    case 0x7b: return "STBASE";
+    case 0x7c: return "RET";
+    case 0x7d: return "LDI32";
+    case 0x7e: return "CMPI";
+    case 0x7f: return "CALLFX";
+    case 0x80: return "CALLFX";
+    case 0x81: return "PUSH";
+    case 0x82: return "STK";
+    case 0x83: return "ISUB";
+    case 0x84: return "ISUB";
+    case 0x85: return "DROP";
+    case 0x86: return "STK";
+    case 0x87: return "STK";
+    case 0x88: return "STK";
+    case 0x89: return "JNODEC";
+    default: return nullptr;
+    }
+}
+
 int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIInstr& out) {
     out.offset = pos;
     out.is_jump = false;
@@ -292,9 +461,6 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
         int idx = (int)pos + off;
         return (idx >= 0 && idx < N) ? bc[idx] : 0;
         };
-    auto u24 = [&](int off) -> uint32_t {
-        return ((uint32_t)safe(off) << 16) | ((uint32_t)safe(off + 1) << 8) | safe(off + 2);
-        };
     auto u32 = [&](int off) -> uint32_t {
         return ((uint32_t)safe(off) << 24) | ((uint32_t)safe(off + 1) << 16) |
             ((uint32_t)safe(off + 2) << 8) | safe(off + 3);
@@ -302,328 +468,82 @@ int AIScriptParser::DisasmOne(const std::vector<uint8_t>& bc, uint32_t pos, AIIn
     auto f32 = [&](int off) -> float {
         uint32_t v = u32(off); float f; memcpy(&f, &v, 4); return f;
         };
-    auto hex4 = [](uint32_t v) -> std::string {
-        char buf[16]; snprintf(buf, sizeof(buf), "0x%04X", (unsigned)v); return buf;
-        };
-    auto hex6 = [](uint32_t v) -> std::string {
-        char buf[16]; snprintf(buf, sizeof(buf), "0x%06X", (unsigned)v); return buf;
-        };
 
-    uint8_t b = safe(0);
-    int len = 1;
+    uint8_t op = safe(0);
 
-    // ── 0x81 extended prefix ────────────────────────────────────
-    if (b == 0x81) {
-        uint8_t sub = safe(1);
-        switch (sub) {
+    // Opcode invalido (a VM ignora tudo > 0x89): consome 1 byte como padding.
+    if (op > 0x89) {
+        char buf[16]; snprintf(buf, sizeof(buf), "BAD_%02X", op);
+        out.mnemonic = buf; out.operand = ""; out.length = 1;
+        out.raw[0] = op;
+        return 1;
+    }
 
-        case 0x18: {           // PUSH local frame register (read)
-            uint8_t reg = safe(2);
-            std::string nm = GlobalName(reg);
-            out.mnemonic = "PUSH";
-            out.operand = nm;
+    int len = AI_OP_W[op];
+
+    // Mnemonica
+    const char* mn = AI_OP_MNEM(op);
+    if (mn) {
+        out.mnemonic = mn;
+    }
+    else {
+        char buf[16];
+        const char* fam = (op <= 0x1b) ? "LD" : (op >= 0x4b && op <= 0x73) ? "ST" : "OP";
+        snprintf(buf, sizeof(buf), "%s%02X", fam, op);
+        out.mnemonic = buf;
+    }
+
+    // Operando conforme largura
+    char ob[48];
+    if (len == 1) {
+        out.operand = "";
+    }
+    else if (len == 2) {
+        // operando de 1 byte
+        if (op == 0x18) {            // LOADL: offset local com sinal
+            int8_t sb = (int8_t)safe(1);
+            snprintf(ob, sizeof(ob), "local[%+d]", (int)sb);
             out.uses_global = true;
-            len = 3; break;
-        }
-        case 0x01:             // PUSH immediate byte
-            out.mnemonic = "PUSH";
-            out.operand = "#" + std::to_string(safe(2));
-            len = 3; break;
-
-        case 0x02:
-            out.mnemonic = "PUSH";
-            out.operand = "#" + std::to_string(safe(2)) + "b";
-            len = 3; break;
-
-        case 0x03: {           // PUSH.F IEEE 754 float BE
-            float fv = f32(2);
-            char buf[32]; snprintf(buf, sizeof(buf), "%g", fv);
-            std::string meaning = FloatMeaning(fv);
-            out.mnemonic = "PUSH.F";
-            out.operand = std::string(buf) + (meaning.empty() ? "" : "  ; " + meaning);
-            len = 6; break;
-        }
-        case 0x09: {           // LDVAL g[XX]  (read value from local frame)
-            uint8_t reg = safe(2);
-            out.mnemonic = "LDVAL";
-            out.operand = GlobalName(reg);
-            out.uses_global = true;
-            len = 3; break;
-        }
-        case 0x0C: {           // CALLAPI <24-bit address>
-            uint32_t addr = u32(2);
-            out.mnemonic = "CALLAPI";
-            out.operand = hex6(addr);
-            out.is_call = true;
-            out.target = addr;
-            len = 6; break;
-        }
-        case 0x07: {           // JMP (long form)
-            uint32_t addr = u24(2);
-            out.mnemonic = "JMP";
-            out.operand = hex4(addr);
-            out.is_jump = true;
-            out.target = addr;
-            len = 5; break;
-        }
-        case 0x7A: {           // JMPNODE (long form)
-            uint32_t n = u24(2);
-            out.mnemonic = "JMPNODE";
-            out.operand = "N" + std::to_string(n);
-            out.is_call = true;
-            out.target = n;
-            len = 5; break;
-        }
-        case 0x7D: {           // PUSH.I int32
-            uint32_t v = u32(2);
-            char buf[32]; snprintf(buf, sizeof(buf), "%u", v);
-            out.mnemonic = "PUSH.I";
-            out.operand = buf;
-            len = 6; break;
-        }
-        case 0x12: {           // PUSH.SI signed int32
-            int32_t sv; uint32_t uv = u32(2); memcpy(&sv, &uv, 4);
-            char buf[32]; snprintf(buf, sizeof(buf), "%d", sv);
-            out.mnemonic = "PUSH.SI";
-            out.operand = buf;
-            len = 6; break;
-        }
-        case 0x7B: {           // PUSH.FLAGS 32-bit bitmask
-            char buf[16]; snprintf(buf, sizeof(buf), "0x%08X", u32(2));
-            out.mnemonic = "PUSH.FLAGS";
-            out.operand = buf;
-            len = 6; break;
-        }
-        case 0x16: {           // PUSH word immediate
-            out.mnemonic = "PUSH.W";
-            out.operand = "#" + std::to_string(safe(2));
-            len = 3; break;
-        }
-        case 0x08: {           // PUSH #byte (another immediate form)
-            out.mnemonic = "PUSH";
-            out.operand = "#" + std::to_string(safe(2)) + "x";
-            len = 3; break;
-        }
-        default: {
-            char buf[16]; snprintf(buf, sizeof(buf), "81_%02X", sub);
-            out.mnemonic = buf;
-            out.operand = "";
-            len = 2; break;
-        }
-        }
-    }
-
-    // ── Standalone 0x09 XX = PUSH_ADDR &g[XX] (write mode) ─────
-    else if (b == 0x09) {
-        uint8_t reg = safe(1);
-        out.mnemonic = "PUSH_ADDR";
-        out.operand = GlobalName(reg);
-        out.uses_global = true;
-        // Mark if writing to key globals
-        if (reg == 0xF4 || reg == 0xF0)
-            out.is_action_write = true;
-        len = 2;
-    }
-
-    // ── 0x08 FF FF FF XX = PUSH_ADDR &g_shared[XX] ──────────────
-    else if (b == 0x08 &&
-        safe(1) == 0xFF && safe(2) == 0xFF && safe(3) == 0xFF) {
-        uint8_t addr = safe(4);
-        out.mnemonic = "PUSH_ADDR";
-        out.operand = SharedName(addr);
-        out.uses_shared_mem = true;
-        len = 5;
-    }
-
-    // ── Standard control flow ────────────────────────────────────
-    else if (b == 0x07) {
-        uint32_t addr = u24(1);
-        out.mnemonic = "JMP";
-        out.operand = hex4(addr);
-        out.is_jump = true;
-        out.target = addr;
-        len = 4;
-    }
-    else if (b == 0x7A) {
-        uint32_t n = u24(1);
-        out.mnemonic = "JMPNODE";
-        out.operand = "N" + std::to_string(n);
-        out.is_call = true;
-        out.target = n;
-        len = 4;
-    }
-    else if (b == 0x74) {
-        uint32_t a = u24(1);
-        out.mnemonic = "JFALSE"; out.operand = hex4(a);
-        out.is_jump = true; out.target = a; len = 4;
-    }
-    else if (b == 0x75) {
-        uint32_t a = u24(1);
-        out.mnemonic = "JTRUE"; out.operand = hex4(a);
-        out.is_jump = true; out.target = a; len = 4;
-    }
-    else if (b == 0x76) {
-        uint32_t a = u24(1);
-        out.mnemonic = "JCOND"; out.operand = hex4(a);
-        out.is_jump = true; out.target = a; len = 4;
-    }
-    else if (b == 0x78) {
-        uint32_t skip = safe(1);
-        char buf[32]; snprintf(buf, sizeof(buf), "-> 0x%04X", pos + 2 + skip);
-        out.mnemonic = "BRT";  out.operand = buf;
-        out.is_jump = true; out.target = pos + 2 + skip; len = 2;
-    }
-    else if (b == 0x79) {
-        uint32_t skip = safe(1);
-        char buf[32]; snprintf(buf, sizeof(buf), "-> 0x%04X", pos + 2 + skip);
-        out.mnemonic = "BRF";  out.operand = buf;
-        out.is_jump = true; out.target = pos + 2 + skip; len = 2;
-    }
-    else if (b == 0x77) {
-        uint32_t back = safe(1);
-        char buf[32]; snprintf(buf, sizeof(buf), "-> 0x%04X", (pos + 2 > back) ? (pos + 2 - back) : 0);
-        out.mnemonic = "JMP.B"; out.operand = buf;
-        out.is_jump = true; out.target = (pos + 2 > back) ? (pos + 2 - back) : 0; len = 2;
-    }
-    else if (b == 0x7E) {
-        uint32_t back = safe(1);
-        char buf[32]; snprintf(buf, sizeof(buf), "-> 0x%04X", (pos + 2 > back) ? (pos + 2 - back) : 0);
-        out.mnemonic = "LOOP.B"; out.operand = buf;
-        out.is_jump = true; out.target = (pos + 2 > back) ? (pos + 2 - back) : 0; len = 2;
-    }
-
-    // ── 0x7D = RETURN ────────────────────────────────────────────
-    else if (b == 0x7D) {
-        uint32_t v = u32(1);
-        out.mnemonic = "RETURN";
-        out.operand = (v == 0) ? "FAIL" : (v == 1 ? "SUCCESS" : std::to_string(v));
-        len = 5;
-    }
-    // ── 0x7C = MASK ──────────────────────────────────────────────
-    else if (b == 0x7C) {
-        char buf[8]; snprintf(buf, 8, "#%02X", safe(1));
-        out.mnemonic = "MASK"; out.operand = buf; len = 2;
-    }
-
-    // ── Branch-tree conditionals ─────────────────────────────────
-    else if (b == 0x85) { out.mnemonic = "IFTRUE";  out.operand = ""; len = 1; }
-    else if (b == 0x86) { out.mnemonic = "IFFALSE"; out.operand = ""; len = 1; }
-    else if (b == 0x87) { out.mnemonic = "IFEITH";  out.operand = ""; len = 1; }
-
-    // ── Result retrieval ─────────────────────────────────────────
-    else if (b == 0x98) { out.mnemonic = "GETRES";     out.operand = ""; len = 1; }
-    else if (b == 0x9A) { out.mnemonic = "GETRES_ALT"; out.operand = ""; len = 1; } // post-JMPNODE N24
-
-    // ── 0x88 = COND #status ──────────────────────────────────────
-    else if (b == 0x88) {
-        uint8_t v = safe(1);
-        std::string st = CondStatus(v);
-        char buf[32]; snprintf(buf, sizeof(buf), "#%02X (%s)", v, st.c_str());
-        out.mnemonic = "COND"; out.operand = buf; len = 2;
-    }
-
-    // ── 0x89 = SWITCH #XX or GETRES_89 ──────────────────────────
-    else if (b == 0x89) {
-        if (safe(1) == 0x00 && safe(2) == 0x00 && safe(3) == 0x00) {
-            uint8_t n = safe(4);
-            char buf[32]; snprintf(buf, sizeof(buf), "#%u (%u cases)", n, n);
-            out.mnemonic = "SWITCH"; out.operand = buf; len = 5;
         }
         else {
-            out.mnemonic = "GETRES_89";  // 1-byte checkpoint/getres variant
-            out.operand = "";
-            len = 1;
+            snprintf(ob, sizeof(ob), "#%u", safe(1));
         }
+        out.operand = ob;
+    }
+    else if (len == 3) {
+        uint32_t v = ((uint32_t)safe(1) << 8) | safe(2);
+        snprintf(ob, sizeof(ob), "#0x%04X", v);
+        out.operand = ob;
+    }
+    else if (len == 5) {
+        // operando de 4 bytes: mostra hex e interpretacao float (heuristica)
+        uint32_t v = u32(1);
+        float fv = f32(1);
+        if (fv > -1e6f && fv < 1e6f && fv != 0.0f) {
+            char fb[24]; snprintf(fb, sizeof(fb), "%g", fv);
+            snprintf(ob, sizeof(ob), "0x%08X (~%s)", v, fb);
+        }
+        else {
+            snprintf(ob, sizeof(ob), "0x%08X", v);
+        }
+        out.operand = ob;
+    }
+    else if (len == 9) {
+        // operando de 8 bytes (op 0x04)
+        uint32_t hi = u32(1), lo = u32(5);
+        snprintf(ob, sizeof(ob), "0x%08X%08X", hi, lo);
+        out.operand = ob;
     }
 
-    // ── Stack / memory ops ───────────────────────────────────────
-    else if (b == 0x24) { out.mnemonic = "STORE";  out.operand = ""; len = 1; }
-    else if (b == 0x32) { out.mnemonic = "MOV";    out.operand = ""; len = 1; }
-    else if (b == 0x33) { out.mnemonic = "MOVC";   out.operand = ""; len = 1; }
-
-    // ── Comparisons ──────────────────────────────────────────────
-    else if (b == 0x22) { out.mnemonic = "EQ";  out.operand = ""; len = 1; }
-    else if (b == 0x1E) { out.mnemonic = "NE";  out.operand = ""; len = 1; }
-    else if (b == 0x1C) { out.mnemonic = "LT";  out.operand = ""; len = 1; }
-    else if (b == 0x28) { out.mnemonic = "GT";  out.operand = ""; len = 1; }
-    else if (b == 0x2C) { out.mnemonic = "LE";  out.operand = ""; len = 1; }
-    else if (b == 0x3E) { out.mnemonic = "CMP"; out.operand = ""; len = 1; }
-
-    // ── Arithmetic ───────────────────────────────────────────────
-    else if (b == 0x3A) { out.mnemonic = "ADD"; out.operand = ""; len = 1; }
-    else if (b == 0x35) { out.mnemonic = "SUB"; out.operand = ""; len = 1; }
-    else if (b == 0x36) { out.mnemonic = "ABS"; out.operand = ""; len = 1; }
-    else if (b == 0x30) { out.mnemonic = "MUL"; out.operand = ""; len = 1; }
-
-    // ── Bit manipulation ─────────────────────────────────────────
-    else if (b == 0x47) { out.mnemonic = "SETBIT"; out.operand = ""; len = 1; }
-    else if (b == 0x49) { out.mnemonic = "CLRBIT"; out.operand = ""; len = 1; }
-
-    // ── Flow control ─────────────────────────────────────────────
-    else if (b == 0x0C) { out.mnemonic = "YIELD"; out.operand = ""; len = 1; }
-
-    // ── Timer compare (0x57 XX) ──────────────────────────────────
-    else if (b == 0x57) {
-        char buf[16]; snprintf(buf, sizeof(buf), "#%u", safe(1));
-        out.mnemonic = "CMP_TIMER"; out.operand = buf; len = 2;
-    }
-
-    // ── Flag and state operations (each takes 1-byte operand) ────
-    else if (b == 0x5D) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "STFLAG"; out.operand = buf; len = 2;
-    }
-    else if (b == 0x60) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "GETFL"; out.operand = buf; len = 2;
-    }
-    else if (b == 0x64) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "SETFG"; out.operand = buf; len = 2;
-    }
-    else if (b == 0x67) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "GETST"; out.operand = buf; len = 2;
-    }
-    else if (b == 0x6B) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "LOOPN"; out.operand = buf; len = 2;
-    }
-    else if (b == 0x6C) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "MODF"; out.operand = buf; len = 2;
-    }
-    else if (b == 0x6E) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "SETST"; out.operand = buf; len = 2;
-    }
-    else if (b == 0x6F) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "SETST2"; out.operand = buf; len = 2;
-    }
-    else if (b == 0x73) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "TEST"; out.operand = buf; len = 2;
-    }
-
-    // ── 0x4F = POPN (pop N values from stack into sequential globals) ──
-    else if (b == 0x4F) {
-        char buf[8]; snprintf(buf, 8, "#%u", safe(1));
-        out.mnemonic = "POPN"; out.operand = buf; len = 2;
-    }
-
-    // ── Fallback ─────────────────────────────────────────────────
-    else {
-        char buf[8]; snprintf(buf, 8, "???_%02X", b);
-        out.mnemonic = buf; out.operand = ""; len = 1;
-    }
-
-    // Store raw bytes
+    // Marcar fluxo (saltos de no' e chamadas)
+    if (op == 0x7a || op == 0x89) { out.is_jump = true; }   // CALLNODE / JNODEC
+    if (op == 0x26 || op == 0x27 || op == 0x7f || op == 0x80) { out.is_call = true; }  // CALLFX
     for (int i = 0; i < len && i < 8; i++)
         out.raw[i] = safe(i);
     out.length = len;
     return len;
 }
+
 
 // Disassemble all nodes
 void AIScriptParser::DisasmNodes(AIScriptFile& f) {
@@ -803,6 +723,33 @@ std::vector<std::string> AIScriptParser::ParseStringTable(
     return result;
 }
 
+// Liga referencias a strings no bytecode (opcode 0x07 LDI32 -> tabela de strings).
+// Padrao: 07 <u32 V> 81 ...  onde V indexa o inicio de um token na tabela de strings
+// (zona entre fim-do-bytecode e marker 0x447A). Preenche f.string_refs (offset_bc -> texto).
+// Regra: V < tamanho_tabela e V==0 ou tabela[V-1]==0 e tabela[V] e' ASCII imprimivel.
+void AIScriptParser::AnnotateStringRefs(AIScriptFile& f) {
+    f.string_refs.clear();
+    const auto& bc = f.bytecode;
+    const int N = (int)bc.size();
+    // A tabela de strings comeca logo apos o bytecode no ficheiro original.
+    // f.string_table_raw guarda esses bytes (offset 0 = primeira string).
+    const std::vector<uint8_t>& tbl = f.string_table_raw;
+    if (tbl.empty()) return;
+    for (int i = 0; i + 6 <= N; i++) {
+        if (bc[i] != 0x07 || bc[i + 5] != 0x81) continue;
+        uint32_t V = ((uint32_t)bc[i + 1] << 24) | ((uint32_t)bc[i + 2] << 16) |
+            ((uint32_t)bc[i + 3] << 8) | bc[i + 4];
+        if (V >= tbl.size()) continue;
+        bool tok_start = (V == 0) || (tbl[V - 1] == 0x00) || (tbl[V - 1] == 0x0A);
+        if (!tok_start) continue;
+        if (tbl[V] < 32 || tbl[V] > 126) continue;
+        std::string s;
+        size_t p = V;
+        while (p < tbl.size() && tbl[p] >= 32 && tbl[p] <= 126) s += (char)tbl[p++];
+        if (s.size() >= 2) f.string_refs[(uint32_t)i] = s;
+    }
+}
+
 // Node offset table
 // (header = 23 fixed u32 VM config words, then node_count offsets)
 std::vector<uint32_t> AIScriptParser::ParseNodeOffsets(
@@ -877,6 +824,16 @@ AIScriptFile AIScriptParser::Parse(const std::string& filepath) {
     if (code_end < file_size) {
         result.strings = ParseStringTable(data, code_end);
         result.has_debug_strings = !result.strings.empty();
+
+        // Guardar os bytes crus da tabela de strings (code_end ate' ao marker 0x447A)
+        // para resolver as refs do opcode 0x07. Offset 0 = primeira string.
+        size_t str_end = file_size;
+        for (size_t p = code_end; p + 1 < file_size; p++) {
+            if (data[p] == 0x44 && data[p + 1] == 0x7A) { str_end = p; break; }
+        }
+        if (str_end > code_end)
+            result.string_table_raw.assign(data.begin() + code_end,
+                data.begin() + str_end);
     }
 
     result.node_offsets = ParseNodeOffsets(data, code_end,
@@ -890,6 +847,7 @@ AIScriptFile AIScriptParser::Parse(const std::string& filepath) {
     DisasmNodes(result);
     BuildApiCatalog(result);
     DecodeActionTable(result);
+    AnnotateStringRefs(result);
     FindKeyNodes(result);
 
     result.valid = true;

@@ -1,6 +1,7 @@
 ﻿#include "ChunkInspector.h"
 #include "NSHPParser.h"
 #include "NMDLLoader.h"
+#include "Cutscenescriptparser.h"
 #include <imgui.h>
 #include <cstring>
 #include <iostream>
@@ -576,6 +577,12 @@ void ChunkInspector::RenderNMDLInfo() {
             if (ok) {
                 m_Viewport->LoadModel(mdl);
                 std::cout << "[ChunkInspector] NMDL model loaded into viewport\n";
+                // NOTE: the map's SET_POSITION/SET_ANGLES blocks (objects 0x800x via
+                // API_1064, created as NOBJ by LIB_0x4E52) are NOT cameras - all have
+                // pitch=0 (flat to the ground), so they are gameplay objects (spawns/
+                // waypoints/triggers), not viewpoints. Preset map cameras disabled
+                // until a real camera table is identified.
+                m_Viewport->ClearMapCameras();
             }
             else {
                 std::cerr << "[ChunkInspector] NMDLLoader::Load failed — check console\n";

@@ -325,6 +325,15 @@ void Viewport3D::FitCamera(glm::vec3 center, float extent) {
 
 //  Render 
 
+
+void Viewport3D::SetMapCameras(const std::vector<CutsceneScript::CSFieldShot>& shots) {
+    m_MapCameras = shots;
+}
+
+void Viewport3D::ClearMapCameras() {
+    m_MapCameras.clear();
+}
+
 void Viewport3D::Render() {
     ImGui::Begin("3D Viewport", nullptr,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -365,6 +374,24 @@ void Viewport3D::Render() {
         if (ImGui::SmallButton("Reset View")) {
             m_Camera.SetTarget(glm::vec3(0));
             m_Camera.SetDistance(5.0f);
+        }
+        // Map preset cameras: jump the view to a built-in field camera. The model is
+        // drawn through `flip` when Flip Y is on, so mirror the eye to match.
+        if (!m_MapCameras.empty()) {
+            ImGui::TextDisabled("Map cameras:");
+            ImGui::SameLine();
+            for (size_t i = 0; i < m_MapCameras.size(); i++) {
+                char lbl[16];
+                snprintf(lbl, sizeof(lbl), "%zu##mapcam", i + 1);
+                if (ImGui::SmallButton(lbl)) {
+                    const auto& s = m_MapCameras[i];
+                    glm::vec3 eye(s.eye[0], s.eye[1], s.eye[2]);
+                    float yaw = s.yaw;
+                    if (m_FlipY) { eye.y = -eye.y; yaw = -yaw; }
+                    m_Camera.SetFromMapShot(eye, yaw, s.pitch);
+                }
+                if (i + 1 < m_MapCameras.size()) ImGui::SameLine();
+            }
         }
     }
 

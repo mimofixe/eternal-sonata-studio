@@ -19,6 +19,16 @@ void Camera::SetTarget(const glm::vec3& target) {
     UpdatePosition();
 }
 
+
+void Camera::SetFromMapShot(const glm::vec3& eye, float yaw, float pitch) {
+    // Engine field camera: forward = (sin yaw, 0, cos yaw), tilted by pitch.
+    glm::vec3 fwd(sinf(yaw) * cosf(pitch), sinf(pitch), cosf(yaw) * cosf(pitch));
+    m_Distance = 10.0f;                 // arbitrary look-ahead for the orbital model
+    m_Target = eye + fwd * m_Distance;  // so eye = target - fwd*distance = the eye
+    m_Yaw = yaw;
+    m_Pitch = pitch;
+    m_Position = eye;
+}
 void Camera::SetDistance(float distance) {
     m_Distance = std::max(0.1f, distance);
     UpdatePosition();

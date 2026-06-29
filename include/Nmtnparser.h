@@ -15,10 +15,11 @@
 //   +0x00  char[16]   bone name
 //   +0x10  u32 BE     track size
 //   +0x14  u32 BE     flags: 9 slots * 3 bits each, field = (flags>>((8-slot)*3))&7
-//                            field 0 = inactive, 1 = static (preamble),
-//                            2 = keyframed channel
-//   +0x18  N*f32 BE   preamble: one f32 per static slot, in slot order
-//   ...    channels:  one per keyframed slot, in slot order
+//                            field 0 = inactive, 1 = static, 2 = keyframed channel
+//   +0x18  ...        slot entries interleaved in slot order (0..8): a static
+//                     slot is one f32 BE; a channel slot is a channel block.
+//                     Statics and channels are NOT grouped; they appear in
+//                     whatever order the slots fall.
 //
 // SLOTS:  0,1,2 = posX/Y/Z   3,4,5 = rotX/Y/Z   6,7,8 = sclX/Y/Z
 //

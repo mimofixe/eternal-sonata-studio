@@ -8,6 +8,10 @@ public:
 
     void SetPosition(const glm::vec3& pos);
     void SetTarget(const glm::vec3& target);
+    // Place the camera at a world eye looking along a world yaw (radians), matching
+    // the engine's field cameras: forward = (sin yaw, 0, cos yaw). Keeps the orbital
+    // model usable afterwards by deriving a target a fixed distance ahead.
+    void SetFromMapShot(const glm::vec3& eye, float yaw, float pitch = 0.0f);
     void SetDistance(float distance);
     void SetFOV(float fov);
 
