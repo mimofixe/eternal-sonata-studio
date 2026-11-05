@@ -21,6 +21,8 @@ struct MeshGPUData {
     bool   draw_sequential = false;
     bool   needs_depth_offset = false;
     bool   has_vertex_alpha = false;
+    bool   translucent = false;              // vertex alpha or a material opacity < 1:
+    // drawn in the blend pass
     std::string name;                    // NSHP name, for the per-mesh toggle list
     bool   visible = true;               // unchecked in the Meshes popup -> skipped
 
@@ -88,6 +90,8 @@ private:
     std::unordered_map<uint16_t, GLuint> m_MatToAlpha;
     std::unordered_set<uint16_t>          m_MatClampIds;
     std::unordered_set<uint16_t>          m_MatBlendIds;
+    std::unordered_map<uint16_t, GLuint> m_MatToEnv;     // NMTR environment map
+    std::vector<NMTREntry>               m_Materials;    // colour / opacity per material
     std::vector<GLuint>                  m_ModelTextures;
     bool m_HasModel = false;
 

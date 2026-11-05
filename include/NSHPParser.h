@@ -17,11 +17,28 @@ struct FaceSection {
     uint16_t index_count = 0;
 };
 
+// NMTR material, 96 bytes. Field use follows the game's material setup
+// (Xbox 360 sub_82115F80):
+//   +0x00 u16 flags        bit 0x0001 specular (+0x2C colour, +0x3A power /256)
+//                          bit 0x0008 environment map (+0x42 texture, +0x3C strength)
+//   +0x02 u8  layer count  +0x04 layer 0: u32 colour, or u16 texture index when
+//                          bit 0 of +0x0B is set (colours RGBA on PS3, ARGB on 360)
+//   +0x30 u16 alpha texture (0xFFFF none)
+//   +0x34 i16 transparency: opacity = 1 - v / 16384 (used when +0x30 is none)
+//   +0x3C i16 environment-map strength / 16384
+//   +0x42 u16 environment-map texture (0xFFFF none)
+//   +0x44 u16 1 = alpha test
 struct NMTREntry {
     bool    has_diffuse = false;
     int16_t diffuse_img_id = -1;
     int16_t alpha_img_id = -1;
     bool    alpha_cutout = false;   // NMTR +0x44==1: needs GL_CLAMP_TO_EDGE
+    uint16_t flags = 0;             // NMTR +0x00
+    bool    has_color = false;      // layer 0 is a flat colour instead of a texture
+    uint8_t color[4] = { 255, 255, 255, 255 };   // RGBA
+    float   opacity = 1.f;          // 1 - i16(+0x34)/16384
+    int16_t env_img_id = -1;        // +0x42 when flags & 0x0008
+    float   env_strength = 0.f;     // i16(+0x3C)/16384
 };
 
 struct NSHPMesh {
@@ -48,8 +65,9 @@ struct NSHPMesh {
 class NSHPParser {
 public:
     static bool Parse(const uint8_t* data, size_t size, NSHPMesh& out);
+    // argb: colours are stored ARGB (Xbox 360, NMDL version 0x82) instead of RGBA.
     static bool ParseNMTR(const uint8_t* data, size_t size,
-        std::vector<NMTREntry>& out);
+        std::vector<NMTREntry>& out, bool argb = false);
 
 private:
     static float    ReadF32BE(const uint8_t* d);

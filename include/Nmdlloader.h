@@ -16,6 +16,7 @@ struct NMDLModel {
     std::unordered_map<uint16_t, GLuint> mat_to_alpha;
     std::unordered_set<uint16_t>         mat_clamp_ids;  // GL_CLAMP_TO_EDGE (stride-24 billboards)
     std::unordered_set<uint16_t>         mat_blend_ids;  // GL_BLEND (textures with translucent texels)
+    std::unordered_map<uint16_t, GLuint> mat_to_env;     // environment map (NMTR +0x42, flag 0x0008)
     std::vector<GLuint>                  owned_textures;
     glm::vec3  bbox_min{ 1e9f,  1e9f,  1e9f };
     glm::vec3  bbox_max{ -1e9f, -1e9f, -1e9f };

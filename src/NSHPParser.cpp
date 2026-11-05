@@ -27,9 +27,9 @@ float NSHPParser::HalfToFloat(uint16_t h) {
 // RSX CMP: signed normalized 11:11:10, x in the low 11 bits, z in the high 10.
 float NSHPParser::DecodeCMP(uint32_t packed, int comp) {
     int32_t v; float scale;
-    if (comp == 0)      { v = int32_t(packed & 0x7FF);         if (v & 0x400) v -= 0x800; scale = 1023.f; }
+    if (comp == 0) { v = int32_t(packed & 0x7FF);         if (v & 0x400) v -= 0x800; scale = 1023.f; }
     else if (comp == 1) { v = int32_t((packed >> 11) & 0x7FF); if (v & 0x400) v -= 0x800; scale = 1023.f; }
-    else                { v = int32_t((packed >> 22) & 0x3FF); if (v & 0x200) v -= 0x400; scale = 511.f; }
+    else { v = int32_t((packed >> 22) & 0x3FF); if (v & 0x200) v -= 0x400; scale = 511.f; }
     return std::max(v / scale, -1.f);
 }
 
@@ -168,13 +168,14 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
                 v.uv[1] = ReadI16BE(vd + 0x12) / 32767.f;
             }
         }
-        // Repurpose bone_weights[0] as per-vertex alpha for stride-24 non-skinned meshes.
-        // Byte +0x13 is the RGBA alpha (0=transparent, 255=opaque).
+        // Repurpose bone_weights[0] as per-vertex alpha for non-skinned meshes.
+        // The alpha byte of the RGBA vertex colour (0=transparent, 255=opaque).
         // IMPORTANT: only valid for stride >= 24. stride-16 is 16 bytes and stride-20 is
         // 20 bytes — reading vd[0x13] (byte 19) would be out-of-bounds for those.
         // For all other cases set 1.0 (fully opaque) so the two-pass render is not triggered.
         if (!skinned && stride >= 24) {
-            v.bone_weights[0] = vd[0x13] / 255.0f;
+            // RGBA vertex colour: +0x10 on strides 24/32, +0x14 on stride 28.
+            v.bone_weights[0] = vd[stride == 28 ? 0x17 : 0x13] / 255.0f;
         }
         else if (!skinned) {
             v.bone_weights[0] = 1.0f;
@@ -273,13 +274,15 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
     }
 
 
-    // Vertex alpha (byte +0x13) is only meaningful for stride-24 non-skinned meshes
-    // that also have the needs_depth_offset flag (NSHP +0x18 bit 0x0004).
+    // Vertex alpha (byte +0x13 at stride 24, +0x17 at stride 28) is only meaningful
+    // for non-skinned meshes that also have the needs_depth_offset flag (NSHP +0x18
+    // bit 0x0004). Stride 28 is the water (mizu_001 in adg01.e: alpha 0 at the
+    // shore, ~0.7 in open water).
     // That flag marks genuine overlay/blend geometry in both .bop and .e files.
     // Without it, byte +0x13 is UV data (arbitrary values) and must be ignored.
     // This replaces the old binary-only heuristic which incorrectly rejected
     // smooth-alpha overlays with intermediate values (e.g. agg90.bop).
-    if (stride == 24 && out.needs_depth_offset) {
+    if ((stride == 24 || stride == 28) && out.needs_depth_offset) {
         out.has_vertex_alpha = false;
         for (const auto& v : out.vertices) {
             if (v.bone_weights[0] < 0.99f) { out.has_vertex_alpha = true; break; }
@@ -402,7 +405,7 @@ bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
 }
 
 bool NSHPParser::ParseNMTR(const uint8_t* data, size_t size,
-    std::vector<NMTREntry>& out) {
+    std::vector<NMTREntry>& out, bool argb) {
     out.clear();
     if (size < 8 + 96) return false;
     const size_t mat_count = (size - 8) / 96;
@@ -415,8 +418,25 @@ bool NSHPParser::ParseNMTR(const uint8_t* data, size_t size,
             e.has_diffuse = true;
             e.diffuse_img_id = static_cast<int16_t>(ReadU16BE(entry + 0x04));
         }
+        else {
+            // Layer 0 holds a colour, not a texture index (water, flat props).
+            const uint8_t* c = entry + 0x04;
+            e.has_color = true;
+            if (argb) { e.color[0] = c[1]; e.color[1] = c[2]; e.color[2] = c[3]; e.color[3] = c[0]; }
+            else { e.color[0] = c[0]; e.color[1] = c[1]; e.color[2] = c[2]; e.color[3] = c[3]; }
+        }
+        e.flags = ReadU16BE(entry + 0x00);
         e.alpha_img_id = ReadI16BE(entry + 0x30);
         e.alpha_cutout = (ReadU16BE(entry + 0x44) == 1);
+        if (ReadU16BE(entry + 0x30) == 0xFFFF) {
+            const float op = 1.f - ReadI16BE(entry + 0x34) / 16384.f;
+            e.opacity = op < 0.f ? 0.f : (op > 1.f ? 1.f : op);
+        }
+        const uint16_t env = ReadU16BE(entry + 0x42);
+        if ((e.flags & 0x0008) && env != 0xFFFF) {
+            e.env_img_id = static_cast<int16_t>(env);
+            e.env_strength = ReadI16BE(entry + 0x3C) / 16384.f;
+        }
         out.push_back(e);
     }
     std::cout << "[NMTR] " << out.size() << " materials\n";

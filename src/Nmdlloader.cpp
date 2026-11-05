@@ -11,21 +11,21 @@
 
 namespace {
 
-GLuint UploadRGBA8(const std::vector<uint8_t>& rgba, int w, int h) {
-    if (rgba.empty() || w <= 0 || h <= 0) return 0;
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    return tex;
-}
+    GLuint UploadRGBA8(const std::vector<uint8_t>& rgba, int w, int h) {
+        if (rgba.empty() || w <= 0 || h <= 0) return 0;
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return tex;
+    }
 
 } // namespace
 
@@ -142,6 +142,9 @@ bool NMDLLoader::Load(const uint8_t* file_data, size_t file_size,
         out.name = buf;
     }
 
+    // Xbox 360 NMDLs (version byte 0x82) store material colours ARGB, PS3 (0x83) RGBA.
+    const bool argb = nmdl_offset + 9 <= file_size && file_data[nmdl_offset + 8] == 0x82;
+
     std::vector<GLuint>    ntx3_list;
     std::vector<bool>      ntx3_dxt5;
     std::vector<NMTREntry> materials;
@@ -200,7 +203,7 @@ bool NMDLLoader::Load(const uint8_t* file_data, size_t file_size,
         }
         else if (memcmp(p, "NMTR", 4) == 0) {
             std::vector<NMTREntry> local_mats;
-            NSHPParser::ParseNMTR(p, sz, local_mats);
+            NSHPParser::ParseNMTR(p, sz, local_mats, argb);
             if (first_nmtr_count == 0) first_nmtr_count = local_mats.size();
             for (auto& e : local_mats) materials.push_back(e);
             pos += sz;
@@ -281,6 +284,11 @@ bool NMDLLoader::Load(const uint8_t* file_data, size_t file_size,
 
         if (e.alpha_cutout)
             out.mat_clamp_ids.insert(static_cast<uint16_t>(m));
+
+        if (e.env_img_id >= 0 && size_t(e.env_img_id) < tex_source.size()) {
+            GLuint tex = tex_source[e.env_img_id];
+            if (tex) out.mat_to_env[static_cast<uint16_t>(m)] = tex;
+        }
     }
 
     // NMTR +0x44 says "alpha test", not "clamp". Clamping is only a safe
@@ -337,6 +345,7 @@ bool NMDLLoader::Load(const uint8_t* file_data, size_t file_size,
         << tex_source.size() << " textures"
         << (external_textures ? " (external)" : " (internal)")
         << ", " << out.mat_to_tex.size() << " textured"
-        << ", " << out.mat_blend_ids.size() << " DXT5-blend\n";
+        << ", " << out.mat_blend_ids.size() << " DXT5-blend"
+        << ", " << out.mat_to_env.size() << " env-mapped\n";
     return true;
 }

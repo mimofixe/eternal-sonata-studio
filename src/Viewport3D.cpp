@@ -18,6 +18,8 @@ out vec3  FragPos;
 out vec3  Normal;
 out vec2  TexCoord;
 out float v_Alpha;
+out vec3  ViewPos;
+out vec3  ViewNormal;
 uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
@@ -27,6 +29,8 @@ void main(){
     Normal     = mat3(transpose(inverse(model))) * aNormal;
     TexCoord   = aUV;
     v_Alpha    = (u_UseVertexAlpha != 0) ? aBoneAlpha : 1.0;
+    ViewPos    = vec3(view * vec4(FragPos, 1.0));
+    ViewNormal = mat3(view) * Normal;
     gl_Position = projection * view * vec4(FragPos, 1.0);
 })";
 
@@ -36,6 +40,8 @@ in  vec3  FragPos;
 in  vec3  Normal;
 in  vec2  TexCoord;
 in  float v_Alpha;
+in  vec3  ViewPos;
+in  vec3  ViewNormal;
 out vec4 FragColor;
 uniform vec3      lightPos;
 uniform vec3      viewPos;
@@ -49,6 +55,10 @@ uniform int       u_EnableLighting;
 uniform vec3      u_AmbientColor;
 uniform vec3      u_DirLightColor;
 uniform vec3      u_DirLightDir;
+uniform float     u_MatAlpha;      // NMTR opacity (1 - i16(+0x34)/16384)
+uniform int       u_UseEnv;        // NMTR flag 0x0008: environment map at +0x42
+uniform sampler2D u_Env;
+uniform float     u_EnvStrength;   // NMTR i16(+0x3C)/16384
 void main(){
     vec4 texSample = vec4(1.0);
     if (u_UseTexture != 0) {
@@ -61,7 +71,20 @@ void main(){
     }
 
     vec3 baseColor = (u_UseTexture != 0) ? texSample.rgb : objectColor;
-    float outAlpha = ((u_UseTexture != 0) ? texSample.a : 1.0) * v_Alpha;
+    float outAlpha = ((u_UseTexture != 0) ? texSample.a : 1.0) * v_Alpha * u_MatAlpha;
+
+    if (u_UseEnv != 0) {
+        // Sphere-mapped reflection of the environment texture (the map's
+        // backdrop on adg01's water). The game binds this texture to its own
+        // environment slot; the projection used here is the classic
+        // view-space sphere map, an approximation of the game's shader.
+        vec3 n = normalize(ViewNormal);
+        if (!gl_FrontFacing) n = -n;
+        vec3 r = reflect(normalize(ViewPos), n);
+        float m = 2.0 * sqrt(r.x * r.x + r.y * r.y + (r.z + 1.0) * (r.z + 1.0));
+        vec3 env = texture(u_Env, r.xy / max(m, 1e-4) + 0.5).rgb;
+        baseColor = mix(baseColor, env, clamp(u_EnvStrength, 0.0, 1.0));
+    }
 
     if (u_EnableLighting != 0) {
         vec3 N = normalize(Normal);
@@ -233,6 +256,14 @@ void Viewport3D::LoadModel(NMDLModel& model) {
         m_ModelMeshes.push_back(std::move(gpu));
     }
 
+    m_Materials = model.materials;
+    for (auto& gpu : m_ModelMeshes) {
+        gpu.translucent = gpu.has_vertex_alpha;
+        for (const auto& sec : gpu.sections)
+            if (sec.mat_id < m_Materials.size() && m_Materials[sec.mat_id].opacity < 0.999f)
+                gpu.translucent = true;
+    }
+    m_MatToEnv = std::move(model.mat_to_env);
     m_MatToTex = std::move(model.mat_to_tex);
     m_MatToAlpha = std::move(model.mat_to_alpha);
     m_MatClampIds = std::move(model.mat_clamp_ids);
@@ -526,7 +557,7 @@ void Viewport3D::Render() {
     glm::mat4 model = glm::mat4(1.0f);
     if (m_FlipY) model = glm::scale(model, glm::vec3(1.0f, -1.0f, 1.0f));
 
-    // ── Draw single mesh ─────────────────────────────────────────────────────
+    // Draw single mesh 
     if (m_HasMesh && m_MeshVisible && m_VAO) {
         m_MeshShader->Use();
         m_MeshShader->SetMat4("model", model);
@@ -537,6 +568,8 @@ void Viewport3D::Render() {
         m_MeshShader->SetVec3("objectColor", glm::vec3(0.72f, 0.72f, 0.88f));
         m_MeshShader->SetInt("u_UseTexture", 0);
         m_MeshShader->SetInt("u_Diffuse", 0);
+        m_MeshShader->SetFloat("u_MatAlpha", 1.0f);
+        m_MeshShader->SetInt("u_UseEnv", 0);
 
         glBindVertexArray(m_VAO);
         if (m_DrawSequential) {
@@ -554,7 +587,7 @@ void Viewport3D::Render() {
         glBindVertexArray(0);
     }
 
-    // ── Draw NMDL model (multi-mesh, per-section textures) ───────────────────
+    // Draw NMDL model (multi-mesh, per-section textures)
     if (m_HasModel) {
         m_MeshShader->Use();
         m_MeshShader->SetMat4("model", model);
@@ -569,6 +602,10 @@ void Viewport3D::Render() {
         m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
 
         m_MeshShader->SetInt("u_UseVertexAlpha", 0);
+        m_MeshShader->SetInt("u_Env", 2);
+        m_MeshShader->SetInt("u_UseEnv", 0);
+        m_MeshShader->SetFloat("u_MatAlpha", 1.0f);
+        const glm::vec3 defaultColor(0.72f, 0.72f, 0.88f);
 
         // Scene lighting uniforms
         m_MeshShader->SetInt("u_EnableLighting", m_EnableLighting ? 1 : 0);
@@ -586,15 +623,14 @@ void Viewport3D::Render() {
         for (int _pass = 0; _pass < 2; ++_pass) {
             for (const auto& gpu : m_ModelMeshes) {
                 if (!gpu.VAO || !gpu.visible) continue;
-                if (_pass == 0 && gpu.has_vertex_alpha) continue;
-                if (_pass == 1 && !gpu.has_vertex_alpha) continue;
+                if (_pass == 0 && gpu.translucent) continue;
+                if (_pass == 1 && !gpu.translucent) continue;
                 glBindVertexArray(gpu.VAO);
-                if (gpu.has_vertex_alpha) {
+                if (gpu.translucent) {
                     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                     glDepthMask(GL_FALSE);
-                    m_MeshShader->SetInt("u_UseVertexAlpha", 1);
                 }
-                else { m_MeshShader->SetInt("u_UseVertexAlpha", 0); }
+                m_MeshShader->SetInt("u_UseVertexAlpha", gpu.has_vertex_alpha ? 1 : 0);
 
                 if (gpu.needs_depth_offset) {
                     glEnable(GL_POLYGON_OFFSET_FILL);
@@ -615,6 +651,23 @@ void Viewport3D::Render() {
                 else {
                     for (const auto& sec : gpu.sections) {
                         if (sec.index_count == 0) continue;
+                        // Material colour, opacity and environment map (NMTR).
+                        const NMTREntry* mat = sec.mat_id < m_Materials.size()
+                            ? &m_Materials[sec.mat_id] : nullptr;
+                        m_MeshShader->SetVec3("objectColor", (mat && mat->has_color)
+                            ? glm::vec3(mat->color[0], mat->color[1], mat->color[2]) / 255.f
+                            : defaultColor);
+                        m_MeshShader->SetFloat("u_MatAlpha", mat ? mat->opacity : 1.0f);
+                        auto ite = m_MatToEnv.find(sec.mat_id);
+                        if (ite != m_MatToEnv.end() && ite->second != 0) {
+                            glActiveTexture(GL_TEXTURE2);
+                            glBindTexture(GL_TEXTURE_2D, ite->second);
+                            m_MeshShader->SetInt("u_UseEnv", 1);
+                            m_MeshShader->SetFloat("u_EnvStrength", mat ? mat->env_strength : 0.f);
+                        }
+                        else {
+                            m_MeshShader->SetInt("u_UseEnv", 0);
+                        }
                         auto it = m_MatToTex.find(sec.mat_id);
                         if (it != m_MatToTex.end() && it->second != 0) {
                             glActiveTexture(GL_TEXTURE0);
@@ -635,7 +688,7 @@ void Viewport3D::Render() {
                                 m_MeshShader->SetFloat("u_AlphaThreshold", 0.01f);
                             }
                             else {
-                                if (!gpu.has_vertex_alpha) {
+                                if (!gpu.translucent) {
                                     glDisable(GL_BLEND);
                                     glDepthMask(GL_TRUE);
                                 }
@@ -644,7 +697,7 @@ void Viewport3D::Render() {
                         }
                         else {
                             m_MeshShader->SetInt("u_UseTexture", 0);
-                            if (!gpu.has_vertex_alpha) glDisable(GL_BLEND);
+                            if (!gpu.translucent) glDisable(GL_BLEND);
                             m_MeshShader->SetFloat("u_AlphaThreshold", 0.5f);
                         }
                         auto ita = m_MatToAlpha.find(sec.mat_id);
@@ -667,9 +720,11 @@ void Viewport3D::Render() {
                 if (gpu.needs_depth_offset) {
                     glDisable(GL_POLYGON_OFFSET_FILL);
                 }
-                if (gpu.has_vertex_alpha) { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
+                if (gpu.translucent) { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
             }
         } // two-pass
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, 0);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, 0);
         glActiveTexture(GL_TEXTURE0);
@@ -678,7 +733,7 @@ void Viewport3D::Render() {
         glDepthMask(GL_TRUE);  // always restore depth writes after model draw
     }
 
-    // ── Draw skeleton ─────────────────────────────────────────────────────────
+    // raw skeleton
     if (m_HasSkeleton && m_ShowSkeleton) {
         m_BoneShader->Use();
         m_BoneShader->SetMat4("view", view);
@@ -760,6 +815,8 @@ void Viewport3D::CleanupModelGL() {
     m_MatToAlpha.clear();
     m_MatClampIds.clear();
     m_MatBlendIds.clear();
+    m_MatToEnv.clear();
+    m_Materials.clear();
 }
 
 void Viewport3D::CleanupSkeletonGL() {
