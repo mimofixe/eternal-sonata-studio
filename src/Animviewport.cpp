@@ -13,6 +13,9 @@
 #include <cstdio>
 #include <algorithm>
 #include <cfloat>
+#include <set>
+#include <map>
+#include <functional>
 
 // Skinning vertex shader that also forwards the UV so the mesh can be textured.
 static const char* SKIN_VERT = R"(
@@ -42,6 +45,15 @@ void main() {
             + mat3(u_SkinMats[aBoneIds.w]) * w.w;
     Normal      = normalize(nm * aNormal);
     TexCoord    = aUV;
+    // Cloth-vs-leg vertex clamp (skirt only): ABSOLUTE per-capsule rule. A cloth
+    // vertex may never sit inside a leg capsule (per-segment radius: thigh/shin).
+    // The authored run animation itself places skirt vertices inside the leg
+    // (measured 0.001 from the axis); the real game visibly pushes the hem out
+    // past the authored pose, so the rule must be absolute, not relative to the
+    // animation. Covers the mesh BETWEEN cloth bones, which bone-level collision
+    // cannot reach. Two iterations resolve most capsule-vs-capsule interplay;
+    // vertices pinched between crossing thighs end on the nearest leg's surface
+    // (same as the engine: the cloth cannot be outside both legs at once).
     gl_Position = u_Proj * u_View * skinPos;
 }
 )";
@@ -123,15 +135,15 @@ static glm::mat3 AVrotBetween(glm::vec3 a, glm::vec3 b) {
     float la = glm::length(a), lb = glm::length(b);
     if (la < 1e-6f || lb < 1e-6f) return glm::mat3(1.f);
     a /= la; b /= lb;
-    float d = glm::dot(a, b);
-    if (d > 0.9999f) return glm::mat3(1.f);
-    if (d < -0.9999f) {
-        glm::vec3 ax = glm::cross(a, glm::vec3(1, 0, 0));
-        if (glm::length(ax) < 1e-4f) ax = glm::cross(a, glm::vec3(0, 1, 0));
-        return glm::mat3(glm::rotate(glm::mat4(1.f), 3.14159265f, glm::normalize(ax)));
+    const glm::vec3 ax = glm::cross(a, b);
+    const float s = glm::length(ax), d = glm::dot(a, b);
+    if (s < 1e-7f) {
+        if (d > 0.f) return glm::mat3(1.f);
+        glm::vec3 p = glm::cross(a, glm::vec3(1, 0, 0));
+        if (glm::length(p) < 1e-4f) p = glm::cross(a, glm::vec3(0, 1, 0));
+        return glm::mat3(glm::rotate(glm::mat4(1.f), 3.14159265f, glm::normalize(p)));
     }
-    return glm::mat3(glm::rotate(glm::mat4(1.f), std::acos(d),
-        glm::normalize(glm::cross(a, b))));
+    return glm::mat3(glm::rotate(glm::mat4(1.f), std::atan2(s, d), ax / s));
 }
 
 AnimViewport::AnimViewport() {
@@ -224,6 +236,7 @@ void AnimViewport::UploadSkinMesh(const NSHPMesh& mesh, SkinMeshGPU& out) {
     out.draw_sequential = mesh.draw_sequential;
     out.bone_id_list = mesh.boneIDList;
     out.sections = mesh.faceSections;
+
 }
 
 // Build one SkeletalModel per NBN2-bearing NMDL. The model's meshes and textures
@@ -267,6 +280,7 @@ void AnimViewport::BuildGroups(const std::vector<uint8_t>& fdv,
             if (!mesh.has_bones || mesh.vertices.empty() || mesh.boneIDList.empty())
                 continue;
             SkinMeshGPU gpu;
+            gpu.name = mesh.name;
             UploadSkinMesh(mesh, gpu);
             if (gpu.VAO) m.meshes.push_back(std::move(gpu));
         }
@@ -446,6 +460,13 @@ void AnimViewport::ApplyPose(SkeletalModel& m, float frame) {
             b.world_rot = p.world_rot * local_rot[i];
         }
     }
+
+    // Snapshot the rigid (animation-only) pose. Taken HERE (not in
+    // ApplyClothPose) so it refreshes on EVERY path that re-poses the model:
+    // playback ticks, the frame-slider scrub while paused, and load. The cloth
+    // overlay and the shader leg clamp both rely on this being current; a stale
+    // snapshot leaves the leg-clamp capsules at an old pose (invisible failure).
+    m.rigidAnim = m.anim;
 }
 
 void AnimViewport::RebuildSkeletonLines(SkeletalModel& m) {
@@ -474,231 +495,691 @@ void AnimViewport::RebuildSkeletonLines(SkeletalModel& m) {
     m.lineVerts = (int)lines.size();
 }
 
-static glm::vec3 AVclosestOnSeg(glm::vec3 q, glm::vec3 a, glm::vec3 b) {
-    glm::vec3 ab = b - a;
-    float dd = glm::dot(ab, ab);
-    float t = (dd < 1e-9f) ? 0.f : glm::clamp(glm::dot(q - a, ab) / dd, 0.f, 1.f);
-    return a + t * ab;
+// ---------------------------------------------------------------------------
+// Cloth dynamics (Dynabone) - see the format notes in Animviewport.h.
+//
+// Every solved bone ends up with   pos = solved node position   and its rotation
+// is rebuilt from where its chain child landed, so the skin matrices always
+// describe a rigid FK chain: the mesh bends at the joints exactly like under
+// animation and cannot tear.
+// ---------------------------------------------------------------------------
+
+namespace {
+    constexpr float  kClothStep = 1.f / 60.f;   // one cloth frame (game: 1/60 or 1/fps)
+    constexpr float  kKeepOut = 0.001f;         // response margin, mask groups (0x82136b08)
+    constexpr float  kKeepIn = -0.002f;         // response margin, keep-in ids (0x82137510)
+    constexpr int    kKeepInGroup = 29;         // NCLS group 0x1c (+1) holds the keep-in volumes
+    constexpr int    kMaxBodies = 17;           // root + 16 point masses
+    constexpr double kDragCoef = 0.0375;        // 1.2 * 3 / (400 * 0.03 * 8) per unit of NDYN +0x0C
 }
 
-// Parse NDYN (per-bone params), NCLS (collider radii) and NLC2 (collision proxy
-// points) from this model's region and build the cloth simulation data.
+// Parse NBN2 topology + NDYN + NCLS for this model's region.
 void AnimViewport::ParseDynamics(SkeletalModel& m, const std::vector<uint8_t>& fd,
     size_t begin, size_t end) {
     const size_t N = m.bind.size();
     m.cloth.assign(N, ClothBone{});
-    m.pCur.assign(N, glm::vec3(0.f));
-    m.pPrev.assign(N, glm::vec3(0.f));
+    m.clothPos.assign(N, glm::vec3(0.f));
+    m.clothDelta.assign(N, glm::mat3(1.f));
     m.colliders.clear();
+    m.clothGroups.assign(64, { 0, 0 });
+    m.chains.clear();
+    m.sheets.clear();
+    m.clothOrder.clear();
     m.hasCloth = false;
     m.clothInit = false;
     if (N == 0 || end > fd.size() || begin + 8 > end) return;
     const uint8_t* d = fd.data();
 
-    // per-bone chain data from the bind pose
-    bool anyDyn = false;
+    // --- topology ---------------------------------------------------------
+    auto dynFlag = [&](int i) { return m.bind[i].flags != 96 && m.bind[i].flags != 224; };
+    std::vector<std::vector<int>> kids(N);
+    std::vector<int> roots;
+    size_t nDyn = 0;
     for (size_t i = 0; i < N; ++i) {
+        const int par = m.bind[i].parent_idx;
+        if (par >= 0 && par < (int)N) kids[par].push_back((int)i);
+        else roots.push_back((int)i);
+    }
+    // topological order (parents first), children by index
+    for (int r : roots) {
+        std::vector<int> stack(1, r);
+        while (!stack.empty()) {
+            const int b = stack.back(); stack.pop_back();
+            m.clothOrder.push_back(b);
+            for (auto it = kids[b].rbegin(); it != kids[b].rend(); ++it) stack.push_back(*it);
+        }
+    }
+    for (int i : m.clothOrder) {
         ClothBone& cb = m.cloth[i];
-        cb.isDyn = (m.bind[i].flags != 96 && m.bind[i].flags != 224);
-        int par = m.bind[i].parent_idx;
-        cb.isRoot = cb.isDyn && (par < 0 || par >= (int)N || !(m.bind[par].flags != 96 && m.bind[par].flags != 224));
-        if (par >= 0 && par < (int)N) {
-            glm::vec3 rel = m.bind[i].world_pos - m.bind[par].world_pos;
-            glm::mat3 pInv = glm::transpose(m.bind[par].world_rot);
-            cb.localOff = pInv * rel;
-            cb.bindLocalRot = pInv * m.bind[i].world_rot;
-            cb.restLen = glm::length(rel);
-        }
-        if (cb.isDyn) anyDyn = true;
+        const int par = m.bind[i].parent_idx;
+        cb.isDyn = dynFlag(i);
+        nDyn += cb.isDyn;
+        if (!cb.isDyn && par >= 0 && par < (int)N)
+            cb.follower = m.cloth[par].isDyn || m.cloth[par].follower;
     }
-    if (!anyDyn) return;
+    if (nDyn == 0) return;
 
-    // NDYN: 48-byte records {u16 chainlen, u16 bone, ... f32 A@0x08, f32 B@0x10, f32 D@0x1C}
-    for (size_t p = begin; p + 8 <= end; ) {
-        if (!std::memcmp(d + p, "NDYN", 4)) {
-            uint32_t sz = AVbeU32(d + p + 4);
-            size_t cend = std::min(p + sz, end);
-            for (size_t r = p + 8; r + 48 <= cend; r += 48) {
-                uint16_t bone = AVbeU16(d + r + 2);
-                if (bone >= 3 && bone < N) {
-                    float A = AVbeF32(d + r + 0x08);
-                    float B = AVbeF32(d + r + 0x10);
-                    float C = AVbeF32(d + r + 0x14);
-                    float D = AVbeF32(d + r + 0x1C);
-                    ClothBone& cb = m.cloth[bone];
-                    // Engine model: B drives how strongly the bone returns to the
-                    // parent-frame rest direction; C is velocity damping; A is mass.
-                    // D is NOT a hard angle clamp (the projection is Gram-Schmidt
-                    // frame maintenance), so it is not used as a limit here.
-                    // Calibrated against the PS3 retail Dynabone solver: the
-                    // restoring pull toward the rest frame is very weak (~0.01 base),
-                    // so gravity dominates and the skirt hangs instead of snapping
-                    // back to its flared bind pose. NDYN B (3..30) scales it gently.
-                    cb.stiffness = glm::clamp(B * 0.004f, 0.002f, 0.08f);
-                    cb.damping = glm::clamp(C * 0.012f, 0.04f, 0.85f);
-                    cb.mass = glm::clamp(A * 60.f, 0.05f, 0.6f);   // inertia weight (not used to scale gravity)
-                    (void)D;
-                }
+    // --- locate the first NDYN and NCLS of the region ----------------------
+    size_t ndyn = 0, ndynEnd = 0, ncls = 0, nclsEnd = 0;
+    for (size_t p = begin; p + 8 <= end; ++p) {
+        if (!ndyn && !std::memcmp(d + p, "NDYN", 4)) {
+            ndyn = p + 8; ndynEnd = std::min(p + (size_t)AVbeU32(d + p + 4), end);
+        }
+        else if (!ncls && !std::memcmp(d + p, "NCLS", 4)) {
+            ncls = p + 8; nclsEnd = std::min(p + (size_t)AVbeU32(d + p + 4), end);
+        }
+        if (ndyn && ncls) break;
+    }
+
+    // --- NCLS: every group, flattened; group -> [first,last) ----------------
+    if (ncls && ncls + 0x84 <= nclsEnd) {
+        const uint16_t count = AVbeU16(d + ncls + 0x82);
+        uint16_t prev = 0;
+        for (int g = 0; g < 64; ++g) {
+            const uint16_t cum = AVbeU16(d + ncls + 2 + 2 * g);
+            if (cum <= prev || cum > count) continue;
+            const uint16_t first = (uint16_t)m.colliders.size();
+            for (uint16_t k = prev; k < cum; ++k) {
+                const size_t r = ncls + 0x84 + (size_t)k * 48;
+                if (r + 48 > nclsEnd) break;
+                const uint16_t bone = AVbeU16(d + r + 0x02);
+                if (bone >= N) continue;   // 0xFFFF entries are not body-attached
+                ClothSphere s;
+                s.type = d[r + 0x00];
+                s.id = d[r + 0x01];
+                s.bone = bone;
+                s.loff = glm::vec3(AVbeI16(d + r + 0x04), AVbeI16(d + r + 0x06), AVbeI16(d + r + 0x08)) / 64.f;
+                s.r = AVbeF32(d + r + 0x10);
+                m.colliders.push_back(s);
             }
-            p = (sz >= 8) ? p + sz : p + 4;
+            m.clothGroups[g] = { first, (uint16_t)m.colliders.size() };
+            prev = cum;
         }
-        else ++p;
     }
 
-    // NCLS: 48-byte records = body collision SPHERES. Real file-record layout
-    // (verified against the chunk): f32 radius @ +0x04, u16 bone @ +0x26, sphere
-    // centered on the bone (the center field is zero). A small header precedes the
-    // records; we skip it implicitly by keeping only records with a valid bone
-    // index and a limb-scale radius. The engine collides cloth particles against
-    // these spheres (CSphere; the CEllipseCylinder variant is a no-op stub). The
-    // big body spheres (hip/torso) would inflate the skirt into a disk, so keep
-    // only the limb-hugging spheres.
-    {
-        std::unordered_map<uint64_t, bool> seen;
-        for (size_t p = begin; p + 8 <= end; ) {
-            if (!std::memcmp(d + p, "NCLS", 4)) {
-                uint32_t sz = AVbeU32(d + p + 4);
-                size_t cend = std::min(p + sz, end);
-                for (size_t r = p + 8; r + 48 <= cend; r += 48) {
-                    uint16_t bone = AVbeU16(d + r + 0x26);
-                    float rad = AVbeF32(d + r + 0x04);
-                    if (bone < 1 || bone >= N) continue;
-                    if (!(rad > 0.03f && rad <= 0.16f)) continue;   // limb spheres; cap validated so the
-                    // skirt clears the leg without ballooning (leg-vs-skirt penetration ~0, skirt radius
-                    // matches the authored rigid pose). The i16 offset at +0x28/+0x2a/+0x2c (/64,
-                    // bone-local) spreads the spheres ALONG the limb so the whole leg is covered.
-                    glm::vec3 off(AVbeI16(d + r + 0x28), AVbeI16(d + r + 0x2a), AVbeI16(d + r + 0x2c));
-                    off /= 64.f;
-                    uint64_t key = ((uint64_t)bone << 20) ^ (uint64_t)(int)(rad * 1000);
-                    if (seen[key]) continue; seen[key] = true;
-                    ClothSphere s; s.bone = (int)bone; s.loff = off; s.r = rad;
-                    m.colliders.push_back(s);
-                }
-                p = (sz >= 8) ? p + sz : p + 4;
+    // --- NDYN: per-bone records ---------------------------------------------
+    int matched = 0;
+    if (ndyn) {
+        for (size_t i = 0; i < N; ++i) {
+            ClothBone& cb = m.cloth[i];
+            if (!cb.isDyn) continue;
+            const size_t r = ndyn + (size_t)m.bind[i].ndyn_index * 48;
+            if (r + 48 > ndynEnd || (AVbeU32(d + r) & 0xFFFF) != i) continue;
+            ++matched;
+            cb.type = AVbeU16(d + r + 0x00);
+            cb.mask2 = AVbeU16(d + r + 0x04);
+            cb.mask1 = AVbeU16(d + r + 0x06);
+            const float mass = AVbeF32(d + r + 0x08);
+            if (mass > 1e-6f && mass < 100.f) cb.mass = mass;
+            cb.drag = glm::max(AVbeF32(d + r + 0x0C), 0.f);
+            cb.ks = glm::max(AVbeF32(d + r + 0x10), 0.f);
+            cb.kd = glm::max(AVbeF32(d + r + 0x14), 0.f);
+            cb.sheetThr = AVbeU16(d + r + 0x28) / 64.f;
+            const uint32_t lk = AVbeU32(d + r + 0x18);
+            const size_t linkBase = ndyn + nDyn * 48;
+            for (uint32_t k = 0; k < (lk >> 24); ++k) {
+                const size_t e = linkBase + (size_t)((lk & 0xFFFFFF) + k) * 32;
+                if (e + 32 > ndynEnd) break;          // variant chunks without the table
+                const uint32_t o = AVbeU32(d + e);
+                if (o < N) cb.links.push_back({ (int)o, AVbeF32(d + e + 4), AVbeF32(d + e + 8) });
             }
-            else ++p;
+            const uint8_t cid = d[r + 0x20];
+            if (cid) {
+                const auto range = m.clothGroups[kKeepInGroup];
+                for (uint16_t k = range.first; k < range.second; ++k)
+                    if (m.colliders[k].id == cid && m.colliders[k].type == 0) cb.keepIn.push_back(k);
+            }
         }
     }
 
-    m.hasCloth = anyDyn;   // simulation runs on gravity+constraints even with no spheres
+    // --- chains --------------------------------------------------------------
+    // root: dynamic bone with flag 0x2 (or a dynamic bone under a rigid parent);
+    // next: first dynamic child without 0x2, or one that also ends (0x8) the chain.
+    int keepIn = 0, bodies = 0;
+    for (int i : m.clothOrder) {
+        const ClothBone& cb = m.cloth[i];
+        if (!cb.isDyn) continue;
+        const int par = m.bind[i].parent_idx;
+        const bool parDyn = par >= 0 && par < (int)N && m.cloth[par].isDyn;
+        if (!(m.bind[i].flags & 0x2) && parDyn) continue;
+        ClothChain c;
+        c.bones.push_back(i);
+        for (int b = i; (int)c.bones.size() < kMaxBodies; ) {
+            if (b != i && (m.bind[b].flags & 0x8)) break;
+            int next = -1;
+            for (int k : kids[b]) {
+                const uint16_t f = m.bind[k].flags;
+                if (m.cloth[k].isDyn && (!(f & 0x2) || (f & 0x8))) { next = k; break; }
+            }
+            if (next < 0) break;
+            c.bones.push_back(next);
+            b = next;
+        }
+        if (c.bones.size() < 2) continue;
+        const size_t n = c.bones.size();
+        c.m.resize(n); c.ks.assign(n, 0.f); c.kd.assign(n, 0.f);
+        for (size_t j = 0; j < n; ++j) {
+            c.m[j] = m.cloth[c.bones[j]].mass;
+            if (j) {
+                c.ks[j] = m.cloth[c.bones[j - 1]].ks;
+                c.kd[j] = m.cloth[c.bones[j - 1]].kd;
+                c.spring |= c.ks[j] > 0.f;
+                keepIn += !m.cloth[c.bones[j]].keepIn.empty();
+            }
+        }
+        c.drag = cb.drag;
+        c.substeps = (cb.type & 1) ? 10 : 8;
+        m.cloth[i].chain = (int)m.chains.size();
+        bodies += (int)n - 1;
+        m.chains.push_back(std::move(c));
+    }
+    // --- links and sheets (0x8213c7f8 / 0x8213eee8) ----------------------------
+    std::vector<std::pair<int, int>> where(N, { -1, -1 });   // bone -> (chain, node>0)
+    for (int ci = 0; ci < (int)m.chains.size(); ++ci)
+        for (int j = 1; j < (int)m.chains[ci].bones.size(); ++j)
+            where[m.chains[ci].bones[j]] = { ci, j };
+    std::vector<std::set<int>> adj(m.chains.size());
+    for (int ci = 0; ci < (int)m.chains.size(); ++ci) {
+        ClothChain& c = m.chains[ci];
+        c.links.assign(c.bones.size(), {});
+        for (int j = 1; j < (int)c.bones.size(); ++j) {
+            const ClothBone& cb = m.cloth[c.bones[j]];
+            if (!cb.links.empty()) c.sheetThr = cb.sheetThr;
+            for (const auto& L : cb.links) {
+                const auto t = where[L.bone];
+                if (t.first < 0 || t.first == ci) continue;
+                ClothLink l; l.chain = t.first; l.node = t.second; l.weight = L.weight; l.tol = L.tol;
+                c.links[j].push_back(l);
+                adj[ci].insert(t.first); adj[t.first].insert(ci);
+            }
+        }
+    }
+    std::vector<char> seen(m.chains.size(), 0);
+    for (int pass = 0; pass < 2; ++pass)                     // open paths first, then rings
+        for (int ci = 0; ci < (int)m.chains.size(); ++ci) {
+            if (seen[ci] || adj[ci].empty() || (pass == 0 && adj[ci].size() != 1)) continue;
+            ClothSheet sh;
+            for (int cur = ci; cur >= 0 && sh.chains.size() < 12; ) {
+                seen[cur] = 1; sh.chains.push_back(cur);
+                int nx = -1;
+                for (int k : adj[cur]) if (!seen[k]) { nx = k; break; }
+                cur = nx;
+            }
+            sh.first = 1 << 30; sh.last = 0;
+            for (int k : sh.chains)
+                for (int j = 1; j < (int)m.chains[k].links.size(); ++j)
+                    if (!m.chains[k].links[j].empty()) { sh.first = std::min(sh.first, j); sh.last = std::max(sh.last, j); }
+            if (sh.chains.size() > 1 && sh.last >= sh.first && m.sheets.size() < 8) m.sheets.push_back(sh);
+        }
+
+    std::cout << "[Cloth] " << nDyn << " dynamic bones, " << matched << " NDYN records, "
+        << m.chains.size() << " chains (" << bodies << " bodies), " << m.sheets.size() << " sheets, "
+        << m.colliders.size() << " NCLS records, " << keepIn << " keep-in nodes\n";
+    m.hasCloth = !m.chains.empty();
 }
 
-void AnimViewport::ResetDynamics(SkeletalModel& m) { m.clothInit = false; }
+void AnimViewport::ResetDynamics(SkeletalModel& m) {
+    m.clothInit = false;
+    for (ClothChain& c : m.chains) {
+        c.init = false;
+        for (auto& node : c.links) for (ClothLink& l : node) l.rest = -1.f;
+    }
+}
 
-// One Verlet/PBD step, faithful to the decoded Dynabone solver:
-//   vel    = (pCur - pPrev) * (1 - C)             // Verlet velocity, damped by C
-//   pred   = pCur + vel + gravity*mass*dt^2       // gravity (9.80665) as acceleration
-//   target = parentPos + parentFrame * localOff   // rest dir follows the simulated parent
-//   np     = mix(pred, target, B)                 // B = return strength to rest dir
-//   np     = parentPos + dir(np)*restLen          // HARD length constraint (rescale)
-//   sphere collision push against the NCLS colliders
-// The parent's *simulated* rotation cascades down the chain (srot), reproducing the
-// engine's per-bone frame. dt is a fixed 1/60 substep (see Tick / SettleDynamics).
+namespace {
+    using dvec3 = glm::dvec3;
+
+    // Rod tensions + body accelerations (0x8215ead8/0x821605a0). Body 0 is
+    // kinematic. Fsys is what the tension system sees: the game feeds the spring
+    // and external forces into it with a flipped sign (verified in the XEX).
+    void AVClothAccel(const std::vector<dvec3>& x, const std::vector<double>& m,
+        const std::vector<dvec3>& F, const std::vector<dvec3>& Fsys, std::vector<dvec3>& a) {
+        const int n = (int)x.size(), N = n - 1;
+        double A[kMaxBodies][kMaxBodies + 1] = {};
+        dvec3 u[kMaxBodies];
+        for (int i = 0; i < N; ++i) {
+            const dvec3 dd = x[i + 1] - x[i];
+            const double L = glm::length(dd);
+            u[i] = L > 1e-12 ? dd / L : dvec3(0, -1, 0);
+        }
+        for (int i = 0; i < N; ++i) {
+            const int j1 = i + 1;
+            A[i][i] += -1.0 / m[j1];
+            if (j1 < N) A[i][j1] += glm::dot(u[i], u[j1]) / m[j1];
+            double rhs = -glm::dot(u[i], Fsys[j1] / m[j1]);
+            if (i >= 1) {
+                A[i][i] += -1.0 / m[i];
+                A[i][i - 1] += glm::dot(u[i], u[i - 1]) / m[i];
+                rhs += glm::dot(u[i], Fsys[i] / m[i]);
+            }
+            A[i][N] = rhs;
+        }
+        // Gauss-Jordan with partial pivoting
+        for (int c = 0; c < N; ++c) {
+            int p = c;
+            for (int r = c + 1; r < N; ++r) if (std::abs(A[r][c]) > std::abs(A[p][c])) p = r;
+            if (std::abs(A[p][c]) < 1e-10) continue;
+            if (p != c) for (int k = 0; k <= N; ++k) std::swap(A[p][k], A[c][k]);
+            const double inv = 1.0 / A[c][c];
+            for (int k = c; k <= N; ++k) A[c][k] *= inv;
+            for (int r = 0; r < N; ++r) {
+                if (r == c || A[r][c] == 0.0) continue;
+                const double f = A[r][c];
+                for (int k = c; k <= N; ++k) A[r][k] -= f * A[c][k];
+            }
+        }
+        a.assign(n, dvec3(0.0));
+        for (int j = 1; j < n; ++j) {
+            a[j] = F[j] / m[j] - A[j - 1][N] * u[j - 1] / m[j];
+            if (j < N) a[j] += A[j][N] * u[j] / m[j];
+        }
+    }
+
+    // world center of an NCLS sphere on the current (solved) pose
+    glm::vec3 AVColliderCenter(const SkeletalModel& m, const std::vector<Bone>& R, const ClothSphere& s) {
+        const int b = s.bone;
+        return m.clothPos[b] + m.clothDelta[b] * (R[b].world_rot * s.loff);
+    }
+}
+
+// One cloth frame of one chain (0x821602b0 pre-pass + 0x8215e8a8 substeps).
+// Targets and the root drive are already in c (set by StepDynamics).
+void AnimViewport::SolveChain(SkeletalModel& m, ClothChain& c, float dtf) {
+    (void)m;
+    const int n = (int)c.bones.size();
+    const double dt = dtf, h = dt / c.substeps;
+    const dvec3 g(0.0, -(double)m_Gravity, 0.0);
+    const double cdrag = kDragCoef * c.drag;
+    std::vector<double> mass(n), ks(n), kd(n), L(n, 0.0);
+    std::vector<dvec3> x(n), v(n), tgt(n), F(n), Fs(n), acc;
+    for (int j = 0; j < n; ++j) {
+        mass[j] = c.m[j]; ks[j] = c.ks[j]; kd[j] = c.kd[j];
+        x[j] = dvec3(c.x[j]); v[j] = dvec3(c.v[j]); tgt[j] = dvec3(m.clothPos[c.bones[j]]);
+    }
+    // rest lengths from the animated pose (the rods are inextensible)
+    for (int j = 1; j < n; ++j) L[j] = glm::length(tgt[j] - tgt[j - 1]);
+    const dvec3 rootV = (tgt[0] - x[0]) / dt;   // root driven by velocity (flag +0xe)
+
+    // pre-pass: the root carries the drive velocity; drop radial relative velocity
+    {
+        v[0] = rootV;
+        std::vector<dvec3> w(n, dvec3(0.0));
+        for (int j = 1; j < n; ++j) {
+            const dvec3 dd = x[j] - x[j - 1];
+            w[j] = v[j] - v[j - 1];
+            const double l2 = glm::dot(dd, dd);
+            if (l2 > 1e-20) w[j] -= (glm::dot(w[j], dd) / l2) * dd;
+        }
+        for (int j = 1; j < n; ++j) v[j] = v[j - 1] + w[j];
+    }
+    // pre-sag (0x8215fa38): the spring rest points are moved so that the animated
+    // pose is the static equilibrium under gravity
+    std::vector<dvec3> rel(n, dvec3(0.0));
+    if (c.spring) {
+        std::vector<dvec3> G0(n, dvec3(0.0));
+        for (int j = 1; j < n; ++j) G0[j] = mass[j] * g;
+        AVClothAccel(tgt, mass, G0, G0, acc);
+        for (int j = 1; j < n; ++j) {
+            const dvec3 off = ks[j] > 0.0 ? -(mass[j] * acc[j]) / ks[j] : dvec3(0.0);
+            rel[j] = tgt[j] + off - tgt[0];
+        }
+    }
+    std::vector<dvec3> d(n), w(n);
+    for (int s = 0; s < c.substeps; ++s) {
+        for (int j = 1; j < n; ++j) {
+            dvec3 G = mass[j] * g, U(0.0);
+            if (c.spring)
+                U = ks[j] * ((x[0] + rel[j]) - x[j]) - 2.0 * mass[j] * kd[j] * v[j];
+            if (cdrag > 0.0) {
+                const dvec3 dd = x[j] - x[j - 1];
+                const double ll = glm::length(dd);
+                if (ll > 1e-12) {
+                    const dvec3 uu = dd / ll;
+                    const dvec3 perp = v[j] - glm::dot(v[j], uu) * uu;
+                    G -= cdrag * glm::length(perp) * perp;
+                }
+            }
+            F[j] = G + U; Fs[j] = G - U;
+        }
+        AVClothAccel(x, mass, F, Fs, acc);
+        dvec3 x0 = x[0] + rootV * h;
+        dvec3 px = x0, pv = rootV;
+        for (int j = 1; j < n; ++j) {
+            dvec3 wj = (v[j] - v[j - 1]) + (acc[j] - acc[j - 1]) * h;
+            dvec3 dj = (x[j] - x[j - 1]) + wj * h;
+            {   // length projection (game: flag +0xc, i.e. spring chains only; here
+                // always, since without it a spring-less chain such as JDWRibon
+                // stretches without bound: the game must restore it elsewhere)
+                const double ld = glm::length(dj);
+                if (ld > 1e-12) dj *= L[j] / ld;
+                const double l2 = glm::dot(dj, dj);
+                if (l2 > 1e-20) wj -= (glm::dot(wj, dj) / l2) * dj;
+            }
+            d[j] = dj; w[j] = wj;
+        }
+        x[0] = x0; v[0] = rootV;
+        for (int j = 1; j < n; ++j) { px += d[j]; pv += w[j]; x[j] = px; v[j] = pv; }
+    }
+    for (int j = 0; j < n; ++j) { c.x[j] = glm::vec3(x[j]); c.v[j] = glm::vec3(v[j]); }
+}
+
+// Collision response 0x82137cf0 (mode 0): rotate the node's segment about its
+// parent node until it sits at R + margin from the sphere center (law of
+// cosines), then the nodes below follow the leader.
+void AnimViewport::CollideChain(SkeletalModel& m, ClothChain& c, bool keepIn, float dt) {
+    const std::vector<Bone>& R = m.rigidAnim.size() == m.bind.size() ? m.rigidAnim : m.anim;
+    const int n = (int)c.bones.size();
+    std::vector<float> L(n, 0.f);
+    for (int j = 1; j < n; ++j) L[j] = glm::length(c.tgt[j] - c.tgt[j - 1]);
+
+    auto respond = [&](int j, const glm::vec3& ctr, float rad, float margin) {
+        const float a = rad + margin;
+        const glm::vec3 P = c.x[j - 1];
+        const glm::vec3 toC = ctr - P, toN = c.x[j] - P;
+        const float dist = glm::length(c.x[j] - ctr);
+        if (!((margin > 0.f && dist < a) || (margin < 0.f && dist > a))) return;
+        const float b = L[j], cc = glm::length(toC), ln = glm::length(toN);
+        if (b < 1e-6f || cc < 1e-6f || ln < 1e-6f) return;
+        const float want = std::acos(glm::clamp((b * b + cc * cc - a * a) / (2.f * b * cc), -1.f, 1.f));
+        const float cur = std::acos(glm::clamp(glm::dot(toC, toN) / (cc * ln), -1.f, 1.f));
+        glm::vec3 axis = glm::cross(toC, toN);
+        float la = glm::length(axis);
+        if (la < 1e-9f) {                                  // node on the center line
+            axis = glm::cross(toC, glm::vec3(0, 1, 0));
+            if (glm::length(axis) < 1e-6f) axis = glm::cross(toC, glm::vec3(1, 0, 0));
+            la = glm::length(axis);
+        }
+        axis /= la;
+        const glm::mat3 rot(glm::rotate(glm::mat4(1.f), want - cur, axis));
+        c.x[j] = P + rot * (toN * (b / ln));
+        for (int k = j + 1; k < n; ++k) {                  // follow the leader
+            const glm::vec3 dk = c.x[k] - c.x[k - 1];
+            const float lk = glm::length(dk);
+            if (lk > 1e-6f) c.x[k] = c.x[k - 1] + dk * (L[k] / lk);
+        }
+        if (margin > 0.f) {                                // keep-out: lose the inward normal speed
+            const glm::vec3 nrm = glm::normalize(c.x[j] - ctr);
+            const float vn = glm::dot(c.v[j], nrm);
+            if (vn < 0.f) c.v[j] -= vn * nrm;
+            for (int k = j + 1; k < n; ++k) c.v[k] = (c.x[k] - c.xPrev[k]) / dt;
+        }
+        else {                                             // keep-in: stop
+            for (int k = j; k < n; ++k) c.v[k] = glm::vec3(0.f);
+        }
+        };
+    if (keepIn) {                                          // 0x82137510
+        for (int j = 1; j < n; ++j)
+            for (int k : m.cloth[c.bones[j]].keepIn) {
+                const ClothSphere& s = m.colliders[k];
+                respond(j, AVColliderCenter(m, R, s), s.r, kKeepIn);
+            }
+        return;
+    }
+    for (int pass = 0; pass < 2; ++pass) {                 // 0x82136b08: two mask passes
+        for (int j = 1; j < n; ++j) {
+            const uint16_t mask = pass == 0 ? m.cloth[c.bones[j]].mask1 : m.cloth[c.bones[j]].mask2;
+            for (int b = 0; b < 16; ++b) {
+                if (!(mask >> b & 1u)) continue;
+                const auto range = m.clothGroups[b + 1];
+                for (uint16_t k = range.first; k < range.second; ++k) {
+                    const ClothSphere& s = m.colliders[k];
+                    if (s.type != 0) continue;             // boxes/capsules: not simulated yet
+                    respond(j, AVColliderCenter(m, R, s), s.r, kKeepOut);
+                }
+            }
+        }
+    }
+}
+
+namespace {
+    // rotate v about the unit axis by angle
+    inline glm::vec3 AVRot(const glm::vec3& v, const glm::vec3& axis, float ang) {
+        return glm::mat3(glm::rotate(glm::mat4(1.f), ang, axis)) * v;
+    }
+    inline float AVAngle(const glm::vec3& a, const glm::vec3& b) {      // 0x82134d18
+        const float la = glm::length(a), lb = glm::length(b);
+        if (la < 1e-9f || lb < 1e-9f) return 0.f;
+        return std::acos(glm::clamp(glm::dot(a, b) / (la * lb), -1.f, 1.f));
+    }
+    inline float AVLawCos(float a, float b, float c) {                 // 0x821354f0
+        if (b * c == 0.f) return 0.f;
+        return std::acos(glm::clamp((b * b + c * c - a * a) / (2.f * b * c), -1.f, 1.f));
+    }
+    // rotate segment k of chain x about x[k-1] so its end sits at distance a from T
+    void AVSwing(std::vector<glm::vec3>& x, int k, const glm::vec3& T, float a, float Lk) {
+        const glm::vec3 seg = x[k] - x[k - 1], to = T - x[k - 1];
+        const float c = glm::length(to);
+        glm::vec3 axis = glm::cross(seg, to);
+        const float la = glm::length(axis);
+        if (la < 1e-9f || c < 1e-9f) return;
+        const float ang = AVAngle(seg, to) - AVLawCos(a, Lk, c);
+        x[k] = x[k - 1] + AVRot(seg, axis / la, ang);
+    }
+
+    // 0x8213d640: put node n of chain A at exactly dist from point T, swinging
+    // its segment, or bending the chain above it (backward reach) when one
+    // segment is not enough. Velocities are kept.
+    void AVSheetReach(ClothChain& A, int n, const glm::vec3& T, float dist) {
+        std::vector<glm::vec3>& x = A.x;
+        const int cnt = (int)x.size();
+        std::vector<float> L(cnt, 0.f);
+        for (int j = 1; j < cnt; ++j) L[j] = glm::length(A.tgt[j] - A.tgt[j - 1]);
+        const float c = glm::length(T - x[n - 1]);
+        if (L[n] + dist >= c) {                            // one segment reaches
+            if (dist < c) AVSwing(x, n, T, dist, L[n]);
+        }
+        else {
+            float total = 0.f;
+            for (int k = 1; k <= n; ++k) total += L[k];
+            const glm::vec3 to0 = T - x[0];
+            const float d0 = glm::length(to0);
+            if (total + dist <= d0) {                      // out of reach: stretch toward T
+                float acc = 0.f;
+                for (int k = 1; k <= n; ++k) { acc += L[k]; x[k] = x[0] + to0 * (acc / d0); }
+            }
+            else {
+                x[n] = T - (T - x[n - 1]) * (dist / c);
+                for (int k = n - 1; k >= 1; --k) {
+                    const glm::vec3 vec = x[k + 1] - x[k - 1];
+                    const float dv = glm::length(vec), S = L[k] + L[k + 1];
+                    if (dv < 1e-9f) break;
+                    if (S <= dv) {                         // straight: keep going up
+                        x[k] = x[k + 1] - vec * (L[k + 1] / dv);
+                        if (S == dv) break;
+                        continue;
+                    }
+                    AVSwing(x, k, x[k + 1], L[k + 1], L[k]);
+                    break;
+                }
+                // the top segment may now be long: restore lengths from the root down
+                for (int k = 1; k <= n; ++k) {
+                    const glm::vec3 dk = x[k] - x[k - 1];
+                    const float lk = glm::length(dk);
+                    if (lk > 1e-9f) x[k] = x[k - 1] + dk * (L[k] / lk);
+                }
+            }
+        }
+        for (int k = n + 1; k < cnt; ++k) {                // follow the leader
+            const glm::vec3 dk = x[k] - x[k - 1];
+            const float lk = glm::length(dk);
+            if (lk > 1e-9f) x[k] = x[k - 1] + dk * (L[k] / lk);
+        }
+    }
+
+    // 0x8213f870: flare a chain outward (away from the character's vertical
+    // axis) by ang radians, segment by segment.
+    void AVSheetFlare(ClothChain& A, const glm::vec3& origin, float ang) {
+        std::vector<glm::vec3>& x = A.x;
+        glm::vec3 r = x[0] - origin;
+        if (glm::length(r) < 1e-9f) return;
+        glm::vec3 axis = glm::cross(glm::normalize(r), glm::vec3(0, 1, 0));
+        const float la = glm::length(axis);
+        if (la < 1e-6f) return;
+        axis /= la;
+        for (int j = 1; j < (int)x.size(); ++j) {
+            const float Lj = glm::length(A.tgt[j] - A.tgt[j - 1]);
+            const glm::vec3 d = AVRot(x[j] - x[j - 1], axis, ang);
+            const float ld = glm::length(d);
+            if (ld > 1e-9f) x[j] = x[j - 1] + d * (Lj / ld);
+        }
+    }
+}
+
+// Sheet solver 0x8213f448.
+void AnimViewport::SolveSheets(SkeletalModel& m) {
+    const std::vector<Bone>& R = m.rigidAnim.size() == m.bind.size() ? m.rigidAnim : m.anim;
+    const glm::vec3 origin = R.empty() ? glm::vec3(0.f) : R[0].world_pos;
+    for (const ClothSheet& sh : m.sheets) {
+        const int cnt = (int)sh.chains.size();
+        // rest distances are taken on the animated pose at reset
+        for (int ci : sh.chains) {
+            ClothChain& c = m.chains[ci];
+            for (int j = 1; j < (int)c.links.size(); ++j)
+                for (ClothLink& l : c.links[j])
+                    if (l.rest < 0.f)
+                        l.rest = glm::length(m.chains[l.chain].tgt[l.node] - c.tgt[j]);
+        }
+        // the chain that strays most from the animation leads
+        float best = 0.f; int lead = -1;
+        for (int k = 0; k < cnt; ++k) {
+            const ClothChain& c = m.chains[sh.chains[k]];
+            float dev = 0.f;
+            for (int j = sh.first; j <= sh.last && j < (int)c.x.size(); ++j) dev += glm::length(c.x[j] - c.tgt[j]);
+            if (best - dev < 0.001f) { best = dev; lead = k; }
+        }
+        if (lead < 0 || best <= m.chains[sh.chains[lead]].sheetThr) continue;
+        auto pull = [&](int cur, int nb) {   // neighbour chain nb follows chain cur
+            ClothChain& C = m.chains[sh.chains[cur]];
+            ClothChain& B = m.chains[sh.chains[nb]];
+            for (int j = sh.first; j <= sh.last; ++j) {
+                if (j >= (int)C.x.size() || j >= (int)B.x.size()) break;
+                const ClothLink* lk = nullptr;
+                for (const ClothLink& l : C.links[j]) if (l.chain == sh.chains[nb]) lk = &l;
+                if (!lk || lk->rest <= 0.f) continue;
+                AVSheetReach(B, j, C.x[lk->node], lk->weight * lk->rest);
+            }
+            };
+        for (int k = lead; k > 0; --k) pull(k, k - 1);
+        for (int k = lead; k < cnt - 1; ++k) pull(k, k + 1);
+        const ClothChain& L = m.chains[sh.chains[lead]];
+        const float tol = (sh.first < (int)L.links.size() && !L.links[sh.first].empty()) ? L.links[sh.first][0].tol : 0.f;
+        if (tol > 0.f) {
+            AVSheetFlare(m.chains[sh.chains[lead]], origin, tol);
+            if (lead > 0) AVSheetFlare(m.chains[sh.chains[lead - 1]], origin, tol);
+            if (lead < cnt - 1) AVSheetFlare(m.chains[sh.chains[lead + 1]], origin, tol);
+        }
+    }
+}
+
+// Write the solved positions/rotations over the rigid pose in m.anim.
+void AnimViewport::WriteClothPose(SkeletalModel& m) {
+    const size_t N = m.bind.size();
+    const std::vector<Bone>& R = (m.rigidAnim.size() == N) ? m.rigidAnim : m.anim;
+    for (int i : m.clothOrder) {
+        if (!m.cloth[i].isDyn && !m.cloth[i].follower) continue;
+        m.anim[i].world_pos = m.clothPos[i];
+        m.anim[i].world_rot = m.clothDelta[i] * R[i].world_rot;
+    }
+}
+
+// Pose pass in topological order. advance: run one cloth frame for every chain
+// (else only re-place the stored chain state on the current rigid pose).
+static void AVPoseCloth(SkeletalModel& m, bool advance,
+    const std::function<void(ClothChain&)>& simulate) {
+    const size_t N = m.bind.size();
+    const std::vector<Bone>& R = (m.rigidAnim.size() == N) ? m.rigidAnim : m.anim;
+    std::vector<glm::vec3>& P = m.clothPos;
+    std::vector<glm::mat3>& D = m.clothDelta;
+    // rigid bones first, so colliders follow this frame's animation
+    for (size_t i = 0; i < N; ++i)
+        if (!m.cloth[i].isDyn && !m.cloth[i].follower) { P[i] = R[i].world_pos; D[i] = glm::mat3(1.f); }
+    std::vector<char> done(N, 0);
+    for (int i : m.clothOrder) {
+        const ClothBone& cb = m.cloth[i];
+        const int par = m.bind[i].parent_idx;
+        const bool parOk = par >= 0 && par < (int)N;
+        const bool parMoved = parOk && (m.cloth[par].isDyn || m.cloth[par].follower);
+        const glm::mat3 inh = parMoved ? D[par] : glm::mat3(1.f);
+        if (cb.chain >= 0) {
+            ClothChain& c = m.chains[cb.chain];
+            const int n = (int)c.bones.size();
+            // targets (0x8213d0c0): the chain's bind shape carried by the root's
+            // current frame; the animation of the chain bones themselves is ignored
+            const glm::vec3 root = parMoved ? P[par] + inh * (R[i].world_pos - R[par].world_pos)
+                : R[i].world_pos;
+            const glm::mat3 carry = inh * R[i].world_rot * glm::transpose(m.bind[i].world_rot);
+            for (int j = 0; j < n; ++j)
+                P[c.bones[j]] = root + carry * (m.bind[c.bones[j]].world_pos - m.bind[i].world_pos);
+            c.tgt.resize(n);
+            for (int j = 0; j < n; ++j) c.tgt[j] = P[c.bones[j]];
+            if (!c.init) {
+                c.x = c.tgt; c.v.assign(n, glm::vec3(0.f));
+                c.init = true;
+            }
+            if (advance) {
+                c.xPrev = c.x;
+                simulate(c);
+            }
+            else {
+                // keep the chain shape relative to the root, follow the root
+                const glm::vec3 shift = root - c.x[0];
+                for (glm::vec3& p : c.x) p += shift;
+            }
+            // positions, then rotations from where each chain child landed
+            glm::mat3 frame = inh;
+            for (int j = 0; j < n; ++j) {
+                const int b = c.bones[j];
+                P[b] = c.x[j];
+                if (j + 1 < n) {
+                    const int k = c.bones[j + 1];
+                    D[b] = AVrotBetween(frame * (R[k].world_pos - R[b].world_pos), c.x[j + 1] - c.x[j]) * frame;
+                }
+                else D[b] = frame;
+                frame = D[b];
+                done[b] = 1;
+            }
+            continue;
+        }
+        if (done[i]) continue;
+        if (cb.isDyn || cb.follower) {                     // carried by the parent
+            P[i] = parOk ? P[par] + inh * (R[i].world_pos - R[par].world_pos) : R[i].world_pos;
+            D[i] = inh;
+        }
+    }
+}
+
+// One cloth frame in the game's order (0x8213e420): every chain is solved and
+// kept inside its keep-in volumes (parents first, so child chains start from
+// the solved parent), then the sheet solver, then the keep-out spheres.
 void AnimViewport::StepDynamics(SkeletalModel& m, float dt) {
     const size_t N = m.bind.size();
     if (!m.hasCloth || m.cloth.size() != N || m.anim.size() != N) return;
-
-    std::vector<glm::vec3> rpos(N);
-    std::vector<glm::mat3> srot(N);
-    for (size_t i = 0; i < N; ++i) { rpos[i] = m.anim[i].world_pos; srot[i] = m.anim[i].world_rot; }
-
-    if (!m.clothInit) {
-        for (size_t i = 0; i < N; ++i) if (m.cloth[i].isDyn) { m.pCur[i] = rpos[i]; m.pPrev[i] = rpos[i]; }
-        m.clothInit = true;
-    }
-
-    const float dt2 = dt * dt;
-    const float G = m_Gravity;
-
-    // precompute world sphere centers from the (rigid) pose once per step
-    std::vector<glm::vec3> sc(m.colliders.size());
-    for (size_t k = 0; k < m.colliders.size(); ++k) {
-        const ClothSphere& s = m.colliders[k];
-        sc[k] = (s.bone >= 0 && s.bone < (int)N) ? rpos[s.bone] + srot[s.bone] * s.loff : s.loff;
-    }
-
-    for (size_t i = 0; i < N; ++i) {
-        const ClothBone& cb = m.cloth[i];
-        if (!cb.isDyn) continue;
-        int par = m.bind[i].parent_idx;
-        if (par < 0 || par >= (int)N) continue;
-        if (cb.isRoot) { m.pPrev[i] = m.pCur[i]; m.pCur[i] = rpos[i]; continue; } // pinned
-
-        glm::vec3 parPos = m.cloth[par].isDyn ? m.pCur[par] : rpos[par];
-        glm::mat3 parRot = srot[par];                 // simulated parent rotation (cascade)
-        glm::vec3 restDir = parRot * cb.localOff;      // rest direction in the moving parent frame
-        glm::vec3 target = parPos + restDir;
-
-        // Verlet integrate with real gravity as an acceleration
-        glm::vec3 vel = (m.pCur[i] - m.pPrev[i]) * (1.f - cb.damping);
-        // Gravity is an ACCELERATION: mass-independent (all bones fall at g). The
-        // engine stores a fixed (0,-9.80665,0) per bone; scaling by mass here was a
-        // bug that made the light cloth bones barely fall and billow outward.
-        glm::vec3 np = m.pCur[i] + vel + glm::vec3(0.f, -G, 0.f) * dt2;
-        // return toward the parent-frame rest direction (strength = B)
-        np = glm::mix(np, target, glm::clamp(cb.stiffness, 0.f, 1.f));
-
-        glm::vec3 prev = m.pCur[i];
-        // PBD iterations: hard length constraint + sphere collision
-        for (int it = 0; it < 2; ++it) {
-            glm::vec3 dir = np - parPos; float L = glm::length(dir);
-            if (L > 1e-6f) np = parPos + dir * (cb.restLen / L);   // rescale to rest length
-            // small margin so the cloth sits just off the leg surface (the collision
-            // spheres sit inside the limb mesh); validated to remove leg-through-skirt
-            // clipping while keeping the skirt at its authored width.
-            const float margin = 0.015f;
-            for (size_t k = 0; k < m.colliders.size(); ++k) {
-                float rr = m.colliders[k].r + margin;
-                glm::vec3 dvec = np - sc[k]; float dl = glm::length(dvec);
-                if (dl < rr && dl > 1e-6f)
-                    np = sc[k] + dvec * (rr / dl);                 // push to sphere surface
-            }
-        }
-        m.pPrev[i] = prev; m.pCur[i] = np;
-
-        // this bone's simulated rotation, so its children cascade off it
-        glm::mat3 delta = AVrotBetween(restDir, np - parPos);
-        srot[i] = delta * parRot * cb.bindLocalRot;
-        m.anim[i].world_pos = np;
-        m.anim[i].world_rot = srot[i];
-    }
+    if (!m.clothInit) { ResetDynamics(m); m.clothInit = true; }
+    AVPoseCloth(m, true, [&](ClothChain& c) {
+        SolveChain(m, c, dt);
+        CollideChain(m, c, true, dt);
+        });
+    SolveSheets(m);
+    for (ClothChain& c : m.chains) CollideChain(m, c, false, dt);
+    AVPoseCloth(m, false, nullptr);   // final pose from the chain states
+    WriteClothPose(m);
 }
 
-// Write the current cloth state (m.pCur + the cascade rotations) into m.anim,
-// WITHOUT advancing the simulation. Must be called every rendered frame after the
-// rigid ApplyPose, so that on frames where the fixed-timestep accumulator runs zero
-// substeps the cloth is still drawn from its persistent state instead of snapping
-// back to the rigid pose (which caused a rigid<->simulated strobing/flicker).
+// Overlay the persistent cloth state on the current rigid pose without advancing
+// it (frames where the accumulator runs no step, scrubbing, model switch).
 void AnimViewport::ApplyClothPose(SkeletalModel& m) {
     const size_t N = m.bind.size();
     if (!m.hasCloth || !m.clothInit || m.cloth.size() != N || m.anim.size() != N) return;
-    std::vector<glm::vec3> rpos(N);
-    std::vector<glm::mat3> srot(N);
-    for (size_t i = 0; i < N; ++i) { rpos[i] = m.anim[i].world_pos; srot[i] = m.anim[i].world_rot; }
-    for (size_t i = 0; i < N; ++i) {
-        const ClothBone& cb = m.cloth[i];
-        if (!cb.isDyn) continue;
-        int par = m.bind[i].parent_idx;
-        if (par < 0 || par >= (int)N) continue;
-        if (cb.isRoot) { m.anim[i].world_pos = m.pCur[i]; continue; }
-        glm::vec3 parPos = m.cloth[par].isDyn ? m.pCur[par] : rpos[par];
-        glm::mat3 parRot = srot[par];
-        glm::vec3 restDir = parRot * cb.localOff;
-        glm::vec3 np = m.pCur[i];
-        srot[i] = AVrotBetween(restDir, np - parPos) * parRot * cb.bindLocalRot;
-        m.anim[i].world_pos = np;
-        m.anim[i].world_rot = srot[i];
-    }
+    AVPoseCloth(m, false, nullptr);
+    WriteClothPose(m);
 }
 
 void AnimViewport::SettleDynamics(SkeletalModel& m, int steps) {
     if (!m_Cloth || !m.hasCloth) return;
-    // Each step reads a fresh rigid pose as reference; the sim state lives in
-    // pCur/pPrev. Use the engine's fixed 1/60 substep so settling matches runtime.
     for (int s = 0; s < steps; ++s) {
         if (!m.anims.empty()) ApplyPose(m, m.frame);
-        else m.anim = m.bind;
-        StepDynamics(m, 1.f / 60.f);
+        else { m.anim = m.bind; m.rigidAnim = m.anim; }
+        StepDynamics(m, kClothStep);
     }
 }
 
@@ -707,23 +1188,21 @@ void AnimViewport::Tick(float dt) {
     if (!m_HasContent || !m || !m->playing || m->anims.empty()) return;
     const NMTNAnimation& anim = m->anims[m->animIdx];
     if (anim.frame_count == 0) return;
-    m->frame = std::fmod(m->frame + dt * m_PlaySpeed, (float)anim.frame_count);
+    const float adv = dt * m_PlaySpeed;   // animation frames this tick
+    m->frame = std::fmod(m->frame + adv, (float)anim.frame_count);
     ApplyPose(*m, m->frame);
-    // advance the cloth with the engine's fixed 1/60 timestep, decoupled from the
-    // render framerate; cap the substep count so a hitch can't stall the loop.
     if (m_Cloth && m->hasCloth) {
-        const float fixed = 1.f / 60.f;
-        m_ClothAccum += std::min(dt, 0.1f);
-        int sub = 0;
-        while (m_ClothAccum >= fixed && sub < 8) {
-            ApplyPose(*m, m->frame);     // refresh rigid reference for this substep
-            StepDynamics(*m, fixed);
-            m_ClothAccum -= fixed; ++sub;
+        // Physics runs in animation time (NMTN is authored at 30 fps) at a fixed
+        // 1/60 substep, so the speed slider slows the cloth down with the motion.
+        // The small tolerance stops float drift from skipping a substep.
+        m_ClothAccum += adv / 30.f;
+        int n = 0;
+        while (m_ClothAccum >= kClothStep * 0.999f && n < 8) {
+            m_ClothAccum -= kClothStep;
+            StepDynamics(*m, kClothStep);
+            ++n;
         }
-        // Re-apply the rigid base for this frame, then overlay the cloth from its
-        // persistent state. Done every frame (even when sub==0) so the cloth never
-        // strobes back to the rigid pose between physics ticks.
-        ApplyPose(*m, m->frame);
+        if (m_ClothAccum < 0.f || n == 8) m_ClothAccum = 0.f;
         ApplyClothPose(*m);
     }
     RebuildSkeletonLines(*m);
@@ -735,6 +1214,7 @@ void AnimViewport::SetMat4Array(GLuint prog, const char* name,
     if (loc >= 0)
         glUniformMatrix4fv(loc, count, GL_FALSE, glm::value_ptr(mats[0]));
 }
+
 
 void AnimViewport::Render() {
     ImGui::Begin("Animation Viewport");
@@ -826,8 +1306,10 @@ void AnimViewport::Render() {
         ImGui::Checkbox("Skeleton", &m_ShowSkel);
         if (M.hasCloth) {
             ImGui::SameLine();
-            if (ImGui::Checkbox("Cloth", &m_Cloth) && m_Cloth) {
-                ResetDynamics(M); SettleDynamics(M, 24);
+            if (ImGui::Checkbox("Cloth", &m_Cloth)) {
+                ApplyPose(M, M.frame);   // drop the cloth overlay when turning it off
+                if (m_Cloth) { ResetDynamics(M); SettleDynamics(M, 24); }
+                RebuildSkeletonLines(M);
             }
             ImGui::PushItemWidth(130);
             ImGui::SliderFloat("Gravity", &m_Gravity, 0.f, 15.f, "%.1f");
@@ -911,6 +1393,7 @@ void AnimViewport::Render() {
                     : glm::mat4(1.f);
             }
             SetMat4Array(prog, "u_SkinMats", skin_mats, n_local);
+
 
             glBindVertexArray(mesh.VAO);
 

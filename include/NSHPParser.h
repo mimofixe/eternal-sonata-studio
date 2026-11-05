@@ -58,6 +58,7 @@ private:
     static int16_t  ReadI16BE(const uint8_t* d);
     static float    HalfToFloat(uint16_t h);
     static float    DecodeNormal10_10_10(uint32_t packed, int comp);
+    static float    DecodeCMP(uint32_t packed, int comp);   // RSX 11:11:10 signed
 
     static void TristripToTriangles(const uint16_t* strip, size_t len,
         std::vector<uint16_t>& out);

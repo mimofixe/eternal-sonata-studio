@@ -21,7 +21,12 @@
 //   +0x24   i16       rot2_x_fixed  Euler X (radians × 4096)  — SECONDARY rotation
 //   +0x26   i16       rot2_y_fixed  Euler Y                    overridden per-slot
 //   +0x28   i16       rot2_z_fixed  Euler Z                    by animation tracks
-//   +0x2A..0x33       (10 bytes: scale always 1.0, then 4 zero bytes)
+//   +0x2A..0x2F       (6 bytes: scale always 1.0, then 2 zero bytes)
+//   +0x30   u16       ndyn_index    index into the NDYN 48-byte record array
+//                                   (EBOOT @0x2d1d88: lhz +0x30, ×48, + NDYN base;
+//                                   forms a 0..n-1 permutation over dynamic bones,
+//                                   0 for rigid bones)
+//   +0x32   u16       (zero in pcalg/pcplk)
 //   +0x34   f32       local_x       position relative to parent
 //   +0x38   f32       local_y
 //   +0x3C   f32       local_z
@@ -43,6 +48,7 @@ struct Bone {
     int16_t      child_idx;
     int16_t      sibling_idx;
     uint16_t     flags;         // 96=rigid, 355/353=dynamic chain, 361=effector
+    uint16_t     ndyn_index;    // index into the NDYN record array (0 for rigid bones)
 
     // Raw local bind-pose data from file
     float        rot_x;         // rot1 Euler X, radians

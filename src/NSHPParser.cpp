@@ -51,6 +51,15 @@ void NSHPParser::TristripToTriangles(const uint16_t* strip, size_t len,
     flush();
 }
 
+// RSX CMP: signed normalized 11:11:10, x in the low 11 bits, z in the high 10.
+float NSHPParser::DecodeCMP(uint32_t packed, int comp) {
+    int32_t v; float scale;
+    if (comp == 0) { v = int32_t(packed & 0x7FF);         if (v & 0x400) v -= 0x800; scale = 1023.f; }
+    else if (comp == 1) { v = int32_t((packed >> 11) & 0x7FF); if (v & 0x400) v -= 0x800; scale = 1023.f; }
+    else { v = int32_t((packed >> 22) & 0x3FF); if (v & 0x200) v -= 0x400; scale = 511.f; }
+    return std::max(v / scale, -1.f);
+}
+
 void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
     uint16_t vc, int stride, bool skinned, NSHPMesh& out) {
     out.vertices.clear();
@@ -63,41 +72,25 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
         v.position[1] = ReadF32BE(vd + 0x04);
         v.position[2] = ReadF32BE(vd + 0x08);
         if (skinned) {
-            v.bone_weights[0] = vd[0x0C] / 255.f; v.bone_weights[1] = vd[0x0D] / 255.f;
-            v.bone_weights[2] = vd[0x0E] / 255.f; v.bone_weights[3] = vd[0x0F] / 255.f;
+            // PS3 skinned layout (RSX CMP packing, see the 360 recomp's PS3 asset
+            // notes): +0x0C one CMP dword holding three weights, +0x10 UBYTE4 bone
+            // indices, +0x14 CMP normal. CMP = signed 11:11:10, x in the low bits.
+            // The three packed weights belong to index bytes 3, 2, 1; index byte 0
+            // takes the remainder 1 - (x + y + z). Verified on pcplk/pcalg: every
+            // vertex sums to exactly 1 and every normal is unit length.
+            const uint32_t wcmp = ReadU32BE(vd + 0x0C);
+            const float wx = DecodeCMP(wcmp, 0), wy = DecodeCMP(wcmp, 1), wz = DecodeCMP(wcmp, 2);
+            v.bone_weights[3] = std::max(wx, 0.f);
+            v.bone_weights[2] = std::max(wy, 0.f);
+            v.bone_weights[1] = std::max(wz, 0.f);
+            v.bone_weights[0] = std::max(1.f - (wx + wy + wz), 0.f);
             v.bone_ids[0] = vd[0x10]; v.bone_ids[1] = vd[0x11];
             v.bone_ids[2] = vd[0x12]; v.bone_ids[3] = vd[0x13];
 
-            // "Placeholder bid=0" rule. Some vertices in skinned meshes carry an
-            // incomplete-rigging signature where the weight bytes are e.g.
-            // [0, 16, 2, 0] and bone_ids are [0, 0, X, Y] — total sum ~18/255=0.07.
-            // After shader normalization these end up 89% on bone_id_list[0] (e.g.,
-            // Jhip/JsebC/Jhead) and only 11% on the real bone X — producing severe
-            // spike artifacts on feet, hands, and other extremities during animation
-            // (vertices orbit the placeholder bone instead of following the intended
-            // chain). The fix: any vertex whose total weight is anomalously low
-            // (< 0.5) has its bid=0 slots zeroed, redirecting all weight to the
-            // real bones. Vertices with sum >= 0.5 (normal rigging) are unchanged,
-            // so meshes that legitimately reference bone_id_list[0] (e.g., a weapon
-            // with all vertices on Jsword at bid=0) keep working as before.
-            float sum_w = v.bone_weights[0] + v.bone_weights[1]
-                + v.bone_weights[2] + v.bone_weights[3];
-            if (sum_w < 0.5f) {
-                float adj[4]; float adj_sum = 0.f;
-                for (int k = 0; k < 4; k++) {
-                    adj[k] = (v.bone_ids[k] == 0) ? 0.f : v.bone_weights[k];
-                    adj_sum += adj[k];
-                }
-                // Safety: only apply if zeroing leaves at least one real bone.
-                // (Vertices where every slot has bid=0 are extremely rare; for
-                // those, keep the original weights so the vertex still renders.)
-                if (adj_sum > 1e-6f) {
-                    for (int k = 0; k < 4; k++) v.bone_weights[k] = adj[k];
-                }
-            }
-            float nx = int8_t(vd[0x14]) / 127.f, ny = int8_t(vd[0x15]) / 127.f, nz = int8_t(vd[0x16]) / 127.f;
-            float m2 = nx * nx + ny * ny + nz * nz;
-            if (m2 > 0.5f && m2 < 2.0f) { v.normal[0] = nx; v.normal[1] = ny; v.normal[2] = nz; }
+            const uint32_t ncmp = ReadU32BE(vd + 0x14);
+            v.normal[0] = DecodeCMP(ncmp, 0);
+            v.normal[1] = DecodeCMP(ncmp, 1);
+            v.normal[2] = DecodeCMP(ncmp, 2);
             const int uvoff = stride - 4;   // skinned UV = f16 pair in the last 4 bytes (0x1C@stride32, 0x18@stride28)
             v.uv[0] = HalfToFloat(ReadU16BE(vd + uvoff));
             v.uv[1] = HalfToFloat(ReadU16BE(vd + uvoff + 2));

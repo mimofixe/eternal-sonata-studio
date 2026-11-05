@@ -401,5 +401,19 @@ bool NMTNParser::Parse(const uint8_t* data, size_t size, NMTNAnimation& out) {
         pos += t_size;
     }
 
+    // The header field at +0x20 over-reports the cycle length for some clips
+    // (pcPLK_cf_run says 200 while every channel's last key sits at frame 40,
+    // which froze 80% of the playback on the clamped last pose). Derive the
+    // real cycle from the keyframe extent and keep the smaller of the two.
+    {
+        float max_key = 0.f;
+        for (const auto& tr : out.tracks)
+            for (int s = 0; s < 9; ++s)
+                if (tr.field[s] == 2 && !tr.channel[s].Empty())
+                    max_key = std::max(max_key, (float)tr.channel[s].keys.back().frame);
+        if (max_key > 0.f && (uint16_t)(max_key + 1.5f) < out.frame_count)
+            out.frame_count = (uint16_t)(max_key + 1.5f);
+    }
+
     return !out.tracks.empty();
 }

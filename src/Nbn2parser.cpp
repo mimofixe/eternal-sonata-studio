@@ -86,6 +86,7 @@ bool NBN2Parser::Parse(const uint8_t* data, size_t size, std::vector<Bone>& out)
         bone.rot2_x = ReadI16BE(b + 0x24) / 4096.0f;  // rot2: secondary rotation
         bone.rot2_y = ReadI16BE(b + 0x26) / 4096.0f;
         bone.rot2_z = ReadI16BE(b + 0x28) / 4096.0f;
+        bone.ndyn_index = ReadU16BE(b + 0x30);        // NDYN record index (dynamic bones)
         bone.local_x = ReadF32BE(b + 0x34);
         bone.local_y = ReadF32BE(b + 0x38);
         bone.local_z = ReadF32BE(b + 0x3C);

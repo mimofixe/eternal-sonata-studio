@@ -19,6 +19,7 @@
 // in addition to the skinning attributes.
 struct SkinMeshGPU {
     GLuint VAO = 0, VBO = 0, EBO = 0;
+    std::string name;                        // NSHP mesh name ("skirt", "body", ...)
     size_t vertex_count = 0;
     size_t index_count = 0;
     bool   draw_sequential = false;
@@ -26,29 +27,85 @@ struct SkinMeshGPU {
     std::vector<FaceSection> sections;       // material id + index range per submesh
 };
 
-// Per-bone cloth dynamics parameters, parsed from the NDYN chunks. Dynamic bones
-// (the "JD*"/"eff*" chains: skirt, ribbons, sleeves, hair) are not posed by the
-// animation; the engine simulates them at runtime. We reproduce that here.
+// Cloth dynamics (Dynabone), reverse-engineered from the Xbox 360 executable
+// (chain solver 0x8215e280..0x82160540, builder 0x82118628, collisions
+// 0x82137510 / 0x82136b08 / response 0x82137cf0). The solver was checked against
+// the game's own code run in an interpreter (positions agree to < 2 mm over 2 s).
+//
+// A chain starts at a bone with flag 0x2 (kinematic root, carried by its parent)
+// and follows the first dynamic child until a bone with flag 0x8 (end); an end
+// bone that also has 0x2 starts the next chain. The other bodies are point masses
+// on inextensible rods: gravity, a PD spring toward the animated pose (pre-sagged
+// so the animated pose is the static equilibrium) and quadratic air drag; rod
+// tensions come from a linear solve every substep. dt = 1/60, 10 substeps when
+// the root record's type bit 0 is set, 8 otherwise. After the solve each node is
+// pushed out of the keep-out spheres of its masked groups (+1 mm) and kept inside
+// its keep-in spheres (-2 mm) by rotating its segment about the parent node;
+// the nodes below follow.
+//
+// NDYN record (48 bytes, at chunk+8 + ndyn_index*48):
+//   +0x00 u16 type (bit 0: 10 substeps)        +0x02 u16 bone (cross-check)
+//   +0x04 u16 mask pass 2, +0x06 u16 mask pass 1: bit b -> NCLS group b+1
+//   +0x08 f32 mass   +0x0C f32 air drag (chain value, from the root's record)
+//   +0x10 f32 spring k   +0x14 f32 damping   (segment parent->child: parent's record)
+//   +0x18 u32 (count<<24)|first: links {u32 bone, f32 weight, f32 tol} (32 bytes)
+//             after the records; +0x28 u16 sheet threshold /64
+//   +0x20 u8 keep-in id: NCLS group 29 records with that id
+// Frame order (0x8213e420): every chain solve + keep-in, then the sheet solver
+// (0x8213f448: when a chain of a linked group strays more than the threshold
+// from the animation, its neighbours are pulled to weight * rest distance of it
+// and the three chains flare outward by tol radians), then the keep-out spheres.
+// NCLS record (48 bytes): +0x00 u8 type (0 sphere), +0x01 u8 id, +0x02 u16 bone,
+// +0x04 i16x3 offset /64 (bone frame), +0x0A i16x3 Euler /4096, +0x10 f32 radius.
 struct ClothBone {
-    bool      isDyn = false;     // participates in the simulation
-    bool      isRoot = false;    // first dynamic bone of a chain -> pinned to body
-    glm::vec3 localOff{ 0.f };   // bind offset from parent, in parent bind space
-    glm::mat3 bindLocalRot{ 1.f };
-    float     restLen = 0.f;     // bone length (distance to parent)
-    float     stiffness = 0.15f; // NDYN B: return strength toward the parent-frame rest dir
-    float     damping = 0.06f;   // NDYN C: velocity damping (shoes high, hair low)
-    float     mass = 1.f;        // NDYN A: gravity weight
+    bool      isDyn = false;
+    bool      follower = false;      // rigid bone under a dynamic ancestor (JHribon)
+    int       chain = -1;            // chain whose root is this bone
+    float     mass = 0.003f;         // NDYN +0x08
+    float     ks = 0.f, kd = 0.f;    // NDYN +0x10 / +0x14 (applied to the child body)
+    float     drag = 0.f;            // NDYN +0x0C
+    uint16_t  type = 0;              // NDYN +0x00
+    uint16_t  mask1 = 0, mask2 = 0;  // NDYN +0x06 / +0x04 (pass 1 / pass 2)
+    std::vector<int> keepIn;         // colliders of NCLS group 29 with id == NDYN +0x20
+    struct Link { int bone; float weight, tol; };
+    std::vector<Link> links;         // NDYN +0x18 table (32-byte entries)
+    float     sheetThr = 0.f;        // NDYN +0x28 / 64
 };
 
-// A body collision SPHERE: a bone plus a bone-local offset (NCLS i16 offset /64)
-// and a radius (NCLS f32 @ +0x2c). This matches the engine: the Dynabone collides
-// the cloth particles against sphere colliders (the CEllipseCylinder variant is a
-// no-op stub in the demo; CSphere is what actually runs). World center is recomputed
-// from the rigid pose each step.
-struct ClothSphere {
+struct ClothSphere {                 // NCLS record ("collider")
     int       bone = -1;
-    glm::vec3 loff{ 0.f };
+    uint8_t   type = 0;              // 0 sphere (1 box, 2 capsule: not simulated)
+    uint8_t   id = 0;
+    glm::vec3 loff{ 0.f };           // offset in the bone frame
     float     r = 0.1f;
+};
+
+// Link from a chain node to a node of a neighbouring chain (sheet solver).
+struct ClothLink {
+    int   chain = -1, node = -1;
+    float weight = 1.f, tol = 0.f;
+    float rest = -1.f;               // node distance on the animated pose at reset
+};
+
+// One simulated chain: bodies[0] is the kinematic root.
+struct ClothChain {
+    std::vector<int>       bones;    // bone index per body
+    std::vector<glm::vec3> x, v;     // body state (world)
+    std::vector<glm::vec3> tgt;      // animated pose this frame
+    std::vector<glm::vec3> xPrev;    // state at the start of this frame
+    std::vector<float>     m, ks, kd;// per body (ks/kd of body j from bone j-1)
+    std::vector<std::vector<ClothLink>> links;   // per body
+    float drag = 0.f;
+    float sheetThr = 0.f;
+    int   substeps = 8;
+    bool  spring = false;
+    bool  init = false;
+};
+
+// Chains joined side by side by links (a skirt), in neighbour order.
+struct ClothSheet {
+    std::vector<int> chains;
+    int first = 1, last = 1;         // node range carrying links
 };
 
 // One self-contained animatable model: skeleton + skinned meshes + animations,
@@ -59,6 +116,9 @@ struct SkeletalModel {
 
     std::vector<Bone>      bind;
     std::vector<Bone>      anim;
+    // Rigid (animation-only) pose snapshot, taken at the top of ApplyClothPose;
+    // feeds u_SkinMatsRigid for the per-vertex cloth-vs-leg clamp in the shader.
+    std::vector<Bone> rigidAnim;
     std::vector<glm::mat4> invBind;
     std::unordered_map<std::string, int> boneIndex;
 
@@ -81,8 +141,13 @@ struct SkeletalModel {
 
     // cloth dynamics
     std::vector<ClothBone>    cloth;       // per bone (size == bind.size())
-    std::vector<ClothSphere>  colliders;   // body collision spheres (from NCLS)
-    std::vector<glm::vec3>    pCur, pPrev;  // Verlet particle state (per bone)
+    std::vector<ClothSphere>  colliders;   // NCLS records (all groups, flattened)
+    std::vector<std::pair<uint16_t, uint16_t>> clothGroups; // NCLS group -> [first,last) in colliders
+    std::vector<ClothChain>   chains;      // simulated chains, parents before children
+    std::vector<ClothSheet>   sheets;      // sheet solver groups
+    std::vector<int>          clothOrder;  // topological bone order (parents first)
+    std::vector<glm::vec3>    clothPos;    // solved world positions (per bone)
+    std::vector<glm::mat3>    clothDelta;  // solved rotation delta on top of the rigid pose
     bool  hasCloth = false;
     bool  clothInit = false;
 
@@ -143,7 +208,11 @@ private:
     // cloth dynamics
     void ParseDynamics(SkeletalModel& m, const std::vector<uint8_t>& fd,
         size_t region_begin, size_t region_end);
-    void StepDynamics(SkeletalModel& m, float dt);   // one temporal Verlet step
+    void StepDynamics(SkeletalModel& m, float dt);   // one 1/60 cloth frame
+    void SolveChain(SkeletalModel& m, ClothChain& c, float dt);
+    void CollideChain(SkeletalModel& m, ClothChain& c, bool keepIn, float dt);
+    void SolveSheets(SkeletalModel& m);
+    void WriteClothPose(SkeletalModel& m);
     void ApplyClothPose(SkeletalModel& m);           // write cloth state to m.anim (no advance)
     void SettleDynamics(SkeletalModel& m, int steps); // settle for static preview
     void ResetDynamics(SkeletalModel& m);
