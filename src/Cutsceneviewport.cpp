@@ -24,6 +24,9 @@ static std::string FileStem(const std::string& path) {
 void CutsceneViewport::Load(const std::string& filepath) {
     FreeSlideTextures();
     m_Script = CutsceneScriptParser::Parse(filepath);
+    // Event files (eNNNN.e / eNNNN_PPP.e) open straight in the Event player, with the
+    // map picked from the folder's map scripts.
+    if (m_Player.OpenEvent(filepath)) m_FocusPlayer = true;
     m_ActiveTab = 0;
     m_SlideTime = 0.0f;
     m_SlidePlaying = false;
@@ -511,6 +514,7 @@ void CutsceneViewport::Render() {
         ImGui::TextDisabled("No cutscene loaded.");
         return;
     }
+    if (m_FocusPlayer) ImGui::SetWindowFocus();
     if (ImGui::BeginTabBar("cs_tabs")) {
         if (ImGui::BeginTabItem("Overview")) { RenderOverview();    ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Commands")) { RenderCommands();    ImGui::EndTabItem(); }
@@ -564,6 +568,11 @@ void CutsceneViewport::Render() {
             m_Scene.RenderPanel(map_hint, bank_hint);
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Event player", nullptr, m_FocusPlayer ? ImGuiTabItemFlags_SetSelected : 0)) {
+            m_Player.RenderPanel(m_Script.filename);
+            ImGui::EndTabItem();
+        }
+        m_FocusPlayer = false;
         ImGui::EndTabBar();
     }
 }

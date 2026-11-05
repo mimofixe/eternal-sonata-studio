@@ -80,6 +80,9 @@ add_executable(es_studio
     src/Cutscenescriptparser.cpp
     src/Cutsceneviewport.cpp
     src/Cutscenescene.cpp
+    src/EventScript.cpp
+    src/EventPlayer.cpp
+    src/EventPlayerPanel.cpp
     src/Fntviewer.cpp
     src/Fntparser.cpp
 )

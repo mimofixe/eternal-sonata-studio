@@ -1,6 +1,7 @@
 #pragma once
 #include "Cutscenescriptparser.h"
 #include "Cutscenescene.h"
+#include "EventPlayer.h"
 #include <string>
 #include <map>
 
@@ -39,6 +40,9 @@ private:
 
     // Stage 1: isolated scene renderer (map + actors)
     CutsceneScene m_Scene;
+    // Static event player (EventScript timeline + map setup + skinned actors)
+    EventPlayer m_Player;
+    bool m_FocusPlayer = false;   // an event file was just opened: show the player tab
     // Folder with the character assets (pcplk_v1.p3obj, appkeep2.bmd, ...)
     char m_AssetsRoot[260] = {};
 
