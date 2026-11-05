@@ -74,6 +74,24 @@ void Application::Run() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
+    // The default atlas is ASCII-only, so Japanese text (the credits BMDs, and
+    // the JPN blocks in .e files) would render as blank boxes. Pull in a system
+    // CJK face if one is present; the default font stays as the fallback.
+    {
+        static const ImWchar* jp_ranges = io.Fonts->GetGlyphRangesJapanese();
+        const char* candidates[] = {
+            "C:\\Windows\\Fonts\\meiryo.ttc",
+            "C:\\Windows\\Fonts\\msgothic.ttc",
+            "C:\\Windows\\Fonts\\YuGothM.ttc",
+        };
+        for (const char* path : candidates) {
+            if (std::filesystem::exists(path) &&
+                io.Fonts->AddFontFromFileTTF(path, 16.0f, nullptr, jp_ranges)) {
+                break;
+            }
+        }
+    }
+
     ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 450");
@@ -81,6 +99,9 @@ void Application::Run() {
     m_Running = true;
 
     FileSystemBrowser file_browser;
+    // argv[1], already validated as an existing directory by main().
+    if (!m_Config.start_folder.empty())
+        file_browser.SetRootPath(m_Config.start_folder);
     ChunkInspector chunk_inspector;
     Viewport3D viewport;
     P3TexViewer tex_viewer;
@@ -112,6 +133,21 @@ void Application::Run() {
     // and return the temp path. Otherwise returns `path` unchanged.
     auto resolveDecompressedPath = [](const std::string& path, bool* out_was_compressed) -> std::string {
         if (out_was_compressed) *out_was_compressed = false;
+
+        // Decide from the header alone. Without this, every click paid a full
+        // read of the file just to discover it wasn't compressed - which on a
+        // 250 MB WAV froze the window for seconds before anything happened.
+        const TcxDecompressor::Codec codec = TcxDecompressor::DetectFileCodec(path);
+        if (codec == TcxDecompressor::Codec::None) return path;
+
+        // Damaged beyond recovery - say so once, instead of letting the file
+        // fall through and be shown as undecodable noise.
+        if (codec == TcxDecompressor::Codec::LzssNulEaten) {
+            std::cerr << "[Tcx] " << path << ": "
+                << TcxDecompressor::DescribeCodec(codec) << "\n";
+            return path;
+        }
+
         bool comp = false;
         std::vector<uint8_t> bytes = TcxDecompressor::LoadAndMaybeDecompress(path, &comp);
         if (!comp || bytes.empty()) return path;
@@ -209,7 +245,7 @@ void Application::Run() {
         text_extractor.Render();
         ImGui::End();
 
-        ImGui::Begin("CSF Audio Viewer");
+        ImGui::Begin("Audio Viewer (CSF / CXS)");
         csf_viewer.Render();
         ImGui::End();
 
@@ -287,6 +323,11 @@ void Application::Run() {
                 was_compressed = false;
                 csf_checked.clear();
 
+                // Drop the previous file's file-scoped inspector state up front,
+                // so a format that never repopulates current_file_data cannot
+                // leave the last file's data on screen.
+                chunk_inspector.ClearFileContext();
+
                 // Xbox 360 retail auto-decompression. If this file uses the
                 // proprietary Tcx arithmetic+LZSS format, decompress it once
                 // into a temp file and route all downstream parsers through
@@ -296,6 +337,15 @@ void Application::Run() {
 
                 if (extension == ".csf") {
                     csf_viewer.LoadFile(effective_path);
+                }
+                else if (extension == ".cxs") {
+                    csf_viewer.LoadCXSFile(effective_path);
+                }
+                else if (extension == ".wav") {
+                    // Header only. These are the biggest files in the game
+                    // (up to 250 MB) and carry no chunks worth scanning, so
+                    // they must not fall through to the generic byte scan.
+                    csf_viewer.LoadWavFile(effective_path);
                 }
                 else if (extension == ".bmd") {
                     auto container = ContainerParser::Parse(effective_path);
@@ -320,6 +370,7 @@ void Application::Run() {
                         text_extractor.LoadFromFile(current_file_data);
                         csf_viewer.SetFileContext(current_file_data, loaded_chunks);
                         anim_viewport.LoadFromChunks(current_file_data, loaded_chunks);
+                        chunk_inspector.SetFileContext(current_file_data);
 
                         if (container.has_csf) {
                             csf_viewer.LoadFile(effective_path);
@@ -327,18 +378,32 @@ void Application::Run() {
                     }
                 }
                 else if (extension == ".e" || extension == ".bop" || extension == ".p3obj") {
-                    uint8_t hdr[0x2010] = {};
+                    // The whole file is needed to tell a tutorial from a cutscene:
+                    // both open with the same magic, the same 0x1FE8 code size and a
+                    // "CSL " voice table at 0x2000, and only differ in whether the
+                    // rest of the file carries scene chunks. A header-sized probe
+                    // cannot see that, so read once and reuse the buffer for the
+                    // AI-script probe as well.
+                    std::vector<uint8_t> probe_data;
                     {
                         std::ifstream probe(effective_path, std::ios::binary);
-                        if (probe) probe.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+                        if (probe) {
+                            probe.seekg(0, std::ios::end);
+                            const std::streamoff plen = probe.tellg();
+                            probe.seekg(0);
+                            if (plen > 0) {
+                                probe_data.resize(static_cast<size_t>(plen));
+                                probe.read(reinterpret_cast<char*>(probe_data.data()), plen);
+                            }
+                        }
                     }
 
-                    if (TutorialParser::IsTutorialFile(hdr, sizeof(hdr))) {
+                    if (TutorialParser::IsTutorialFile(probe_data.data(), probe_data.size())) {
                         tutorial_viewer.Load(effective_path);
                         ai_script_viewer.Clear();
                         selected_chunk_idx = -1;
                     }
-                    else if (AIScriptParser::IsAIScript(hdr, sizeof(hdr))) {
+                    else if (AIScriptParser::IsAIScript(probe_data.data(), probe_data.size())) {
                         ai_script_viewer.Load(effective_path);
                         tutorial_viewer.Clear();
                         selected_chunk_idx = -1;
@@ -707,7 +772,7 @@ void Application::Run() {
                     char sel_label[48];
                     snprintf(sel_label, sizeof(sel_label), "Export Selected (%d)", (int)csf_checked.size());
                     if (ImGui::Button(sel_label, ImVec2(-1, 0))) {
-                        std::string base = FileDialog::SaveFile("ATRAC3 Audio\0*.at3\0All Files\0*.*\0");
+                        std::string base = FileDialog::SaveFile("Audio\0*.at3;*.xma\0All Files\0*.*\0");
                         if (!base.empty()) {
                             size_t ext = base.find_last_of('.');
                             if (ext != std::string::npos) base = base.substr(0, ext);
@@ -718,9 +783,10 @@ void Application::Run() {
                                 CSFFile csf;
                                 if (CSFParser::LoadFromMemory(current_file_data.data() + c.offset, c.size, csf)) {
                                     for (size_t ci = 0; ci < csf.clips.size(); ci++) {
-                                        char suf[32];
-                                        snprintf(suf, sizeof(suf), "_%03d_%03d.at3", ci_n, (int)ci);
-                                        if (CSFParser::ExportClipAT3(csf, (uint32_t)ci, base + suf)) n++;
+                                        char suf[40];
+                                        snprintf(suf, sizeof(suf), "_%03d_%03d%s", ci_n, (int)ci,
+                                            CSFCodecExtension(csf.codec));
+                                        if (CSFParser::ExportClip(csf, (uint32_t)ci, base + suf)) n++;
                                     }
                                 }
                                 ci_n++;
@@ -732,7 +798,7 @@ void Application::Run() {
                     ImGui::EndDisabled();
 
                     if (ImGui::Button("Export All CSF", ImVec2(-1, 0))) {
-                        std::string base = FileDialog::SaveFile("ATRAC3 Audio\0*.at3\0All Files\0*.*\0");
+                        std::string base = FileDialog::SaveFile("Audio\0*.at3;*.xma\0All Files\0*.*\0");
                         if (!base.empty()) {
                             size_t ext = base.find_last_of('.');
                             if (ext != std::string::npos) base = base.substr(0, ext);
@@ -743,9 +809,10 @@ void Application::Run() {
                                 CSFFile csf;
                                 if (CSFParser::LoadFromMemory(current_file_data.data() + c.offset, c.size, csf)) {
                                     for (size_t ci = 0; ci < csf.clips.size(); ci++) {
-                                        char suf[32];
-                                        snprintf(suf, sizeof(suf), "_%03d_%03d.at3", j, (int)ci);
-                                        if (CSFParser::ExportClipAT3(csf, (uint32_t)ci, base + suf)) n++;
+                                        char suf[40];
+                                        snprintf(suf, sizeof(suf), "_%03d_%03d%s", j, (int)ci,
+                                            CSFCodecExtension(csf.codec));
+                                        if (CSFParser::ExportClip(csf, (uint32_t)ci, base + suf)) n++;
                                     }
                                 }
                             }
@@ -814,6 +881,10 @@ ImVec4 Application::GetChunkColor(ChunkType type) {
         return ImVec4(1.0f, 0.8f, 0.4f, 1.0f);
     case ChunkType::NTX3:
         return ImVec4(1.0f, 0.4f, 1.0f, 1.0f);
+    case ChunkType::NTX2:
+        return ImVec4(1.0f, 0.5f, 0.8f, 1.0f);
+    case ChunkType::NTEX:
+        return ImVec4(1.0f, 0.6f, 0.9f, 1.0f);
     case ChunkType::NMTN:
         return ImVec4(0.4f, 1.0f, 1.0f, 1.0f);
     case ChunkType::NMTB:

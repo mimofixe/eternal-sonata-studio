@@ -156,6 +156,8 @@ void Viewport3D::UploadMeshToGPU(const NSHPMesh& mesh, MeshGPUData& out) {
     out.draw_sequential = mesh.draw_sequential;
     out.needs_depth_offset = mesh.needs_depth_offset;
     out.has_vertex_alpha = mesh.has_vertex_alpha;
+    out.name = mesh.name;
+    out.visible = true;
 }
 
 //  Single mesh 
@@ -198,6 +200,8 @@ void Viewport3D::LoadMesh(const NSHPMesh& mesh) {
     m_VertexCount = mesh.vertices.size();
     m_DrawSequential = mesh.draw_sequential;
     m_HasMesh = true;
+    m_MeshName = mesh.name;
+    m_MeshVisible = true;   // a freshly loaded mesh is always shown
 
     glm::vec3 mn(FLT_MAX), mx(-FLT_MAX);
     for (const auto& v : mesh.vertices) {
@@ -334,13 +338,87 @@ void Viewport3D::ClearMapCameras() {
     m_MapCameras.clear();
 }
 
+// Per-mesh visibility, which replaced the old single "Mesh" checkbox: a model is
+// often a dozen or more NSHP chunks, and isolating one is the only way to tell
+// which is which. "None" covers what that checkbox did. Kept in a popup so a long
+// list never eats the viewport's vertical space.
+//
+// Shown for a lone NSHP too, even though its list is one row. The control is then
+// strictly a worse "Mesh" checkbox, but a toolbar whose contents depend on how the
+// geometry was loaded is worse still: the button stays in the same place and means
+// the same thing whichever path filled the viewport.
+void Viewport3D::DrawMeshVisibilityUI() {
+    const bool single = !m_HasModel && m_HasMesh;
+    const size_t count = single ? 1u : m_ModelMeshes.size();
+    if (count == 0) return;
+
+    size_t shown = 0;
+    if (single) shown = m_MeshVisible ? 1u : 0u;
+    else for (const auto& g : m_ModelMeshes) if (g.visible) shown++;
+
+    char lbl[64];
+    snprintf(lbl, sizeof(lbl), "Meshes (%zu/%zu)###meshlist", shown, count);
+    if (ImGui::SmallButton(lbl)) ImGui::OpenPopup("##meshvis");
+    if (!ImGui::BeginPopup("##meshvis")) return;
+
+    if (ImGui::SmallButton("All")) {
+        if (single) m_MeshVisible = true;
+        else for (auto& g : m_ModelMeshes) g.visible = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) {
+        if (single) m_MeshVisible = false;
+        else for (auto& g : m_ModelMeshes) g.visible = false;
+    }
+    if (!single) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(right-click list item to solo)");
+    }
+    ImGui::Separator();
+
+    // Cap the height so a 50-mesh map model scrolls instead of growing a popup
+    // taller than the window.
+    if (ImGui::BeginChild("##meshvislist",
+        ImVec2(280.f, std::min<float>(320.f,
+            count * ImGui::GetFrameHeightWithSpacing() + 4.f)))) {
+        if (single) {
+            snprintf(lbl, sizeof(lbl), "0: %s##mv0",
+                m_MeshName.empty() ? "(unnamed)" : m_MeshName.c_str());
+            ImGui::Checkbox(lbl, &m_MeshVisible);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%zu verts, %zu tris",
+                    m_VertexCount, m_IndexCount / 3);
+        }
+        else {
+            for (size_t i = 0; i < m_ModelMeshes.size(); i++) {
+                auto& g = m_ModelMeshes[i];
+                // Names are not unique (and can be empty), so the index both
+                // disambiguates the ImGui id and identifies the mesh.
+                snprintf(lbl, sizeof(lbl), "%zu: %s##mv%zu", i,
+                    g.name.empty() ? "(unnamed)" : g.name.c_str(), i);
+                ImGui::Checkbox(lbl, &g.visible);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    for (size_t k = 0; k < m_ModelMeshes.size(); k++)
+                        m_ModelMeshes[k].visible = (k == i);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%zu verts, %zu sections",
+                        g.vertex_count, g.sections.size());
+                }
+            }
+        }
+    }
+    ImGui::EndChild();
+    ImGui::EndPopup();
+}
+
 void Viewport3D::Render() {
     ImGui::Begin("3D Viewport", nullptr,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
     const bool hasSomething = m_HasMesh || m_HasModel || m_HasSkeleton;
     if (m_HasMesh || m_HasModel) {
-        ImGui::Checkbox("Mesh", &m_ShowMesh);
+        DrawMeshVisibilityUI();
         if (m_HasModel && m_HasSceneLighting) {
             ImGui::SameLine();
             ImGui::Separator();
@@ -449,7 +527,7 @@ void Viewport3D::Render() {
     if (m_FlipY) model = glm::scale(model, glm::vec3(1.0f, -1.0f, 1.0f));
 
     // ── Draw single mesh ─────────────────────────────────────────────────────
-    if (m_HasMesh && m_ShowMesh && m_VAO) {
+    if (m_HasMesh && m_MeshVisible && m_VAO) {
         m_MeshShader->Use();
         m_MeshShader->SetMat4("model", model);
         m_MeshShader->SetMat4("view", view);
@@ -477,7 +555,7 @@ void Viewport3D::Render() {
     }
 
     // ── Draw NMDL model (multi-mesh, per-section textures) ───────────────────
-    if (m_HasModel && m_ShowMesh) {
+    if (m_HasModel) {
         m_MeshShader->Use();
         m_MeshShader->SetMat4("model", model);
         m_MeshShader->SetMat4("view", view);
@@ -507,7 +585,7 @@ void Viewport3D::Render() {
 
         for (int _pass = 0; _pass < 2; ++_pass) {
             for (const auto& gpu : m_ModelMeshes) {
-                if (!gpu.VAO) continue;
+                if (!gpu.VAO || !gpu.visible) continue;
                 if (_pass == 0 && gpu.has_vertex_alpha) continue;
                 if (_pass == 1 && !gpu.has_vertex_alpha) continue;
                 glBindVertexArray(gpu.VAO);

@@ -1,5 +1,6 @@
 #include "P3TexParser.h"
 #include "Ntx2parser.h"
+#include "Ntexparser.h"
 #include <fstream>
 #include <iostream>
 #include <cstring>
@@ -55,24 +56,67 @@ bool P3TexParser::Load(const std::string& filename) {
             std::vector<uint8_t> rgba =
                 Ntx2Parser::Decode(buf + pos, chunk_size, info, pos);
 
-            if (!rgba.empty() && info.width > 0 && info.height > 0) {
-                P3Texture tex;
-                tex.offset = pos;
-                tex.size = chunk_size;
-                tex.width = info.width;
-                tex.height = info.height;
-                tex.format = P3TEX_FORMAT_RGBA8_DECODED;
-                tex.name = info.name;
-                tex.data = std::move(rgba);
+            // Always claim the slot, even when the decode failed. Material
+            // ids index this list positionally, so silently skipping an
+            // undecodable chunk shifts every later texture onto the wrong
+            // material.
+            P3Texture tex;
+            tex.offset = pos;
+            tex.size = chunk_size;
+            tex.width = info.width;
+            tex.height = info.height;
+            tex.format = P3TEX_FORMAT_RGBA8_DECODED;
+            tex.name = info.name;
+            tex.data = std::move(rgba);
 
-                std::cout << "  [NTX2] " << texture_count
-                    << ": " << info.name
-                    << "  " << info.width << "×" << info.height
-                    << std::endl;
+            std::cout << "  [NTX2] " << texture_count
+                << ": " << info.name << "  "
+                << info.width << "×" << info.height
+                << (tex.data.empty() ? "  (undecoded, slot reserved)" : "")
+                << std::endl;
 
-                m_Textures.push_back(std::move(tex));
-                texture_count++;
+            if (tex.data.empty()) { tex.width = 0; tex.height = 0; }
+            m_Textures.push_back(std::move(tex));
+            texture_count++;
+
+            pos += chunk_size;
+            continue;
+        }
+
+        // NTEX (Xbox 360) — a plain PC DDS. Shares the texture index space
+        // with NTX2/NTX3 (see Ntexparser.h).
+        if (pos + 8 <= file_size &&
+            std::memcmp(buf + pos, "NTEX", 4) == 0) {
+
+            uint32_t chunk_size =
+                (buf[pos + 4] << 24) | (buf[pos + 5] << 16) |
+                (buf[pos + 6] << 8) | buf[pos + 7];
+
+            if (chunk_size < 0x88 || pos + chunk_size > file_size) {
+                pos++;
+                continue;
             }
+
+            NTEXInfo info;
+            std::vector<uint8_t> rgba =
+                NtexParser::Decode(buf + pos, chunk_size, info);
+
+            P3Texture tex;
+            tex.offset = pos;
+            tex.size = chunk_size;
+            tex.width = rgba.empty() ? 0 : info.width;
+            tex.height = rgba.empty() ? 0 : info.height;
+            tex.format = P3TEX_FORMAT_RGBA8_DECODED;
+            tex.decoded_was_dxt5 = info.is_dxt5;
+            tex.data = std::move(rgba);
+
+            std::cout << "  [NTEX] " << texture_count << ": "
+                << info.width << "×" << info.height
+                << (tex.data.empty() ? "  (undecoded, slot reserved)" : "")
+                << std::endl;
+
+            m_Textures.push_back(std::move(tex));
+            texture_count++;
 
             pos += chunk_size;
             continue;

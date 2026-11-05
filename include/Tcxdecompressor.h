@@ -16,16 +16,52 @@
 //   - 0x82118AF8  decode_sym  (arithmetic coder, returns one byte/symbol)
 //   - 0x82118C70  decode_loop (LZSS state machine driving decode_sym)
 //
+// Some files (e.g. the credits tables op.bmd / ab.bmd) instead use only the
+// LZSS layer, with no frequency table and no arithmetic coder - the stream
+// starts directly with a control byte. These are Haruhiko Okumura's classic
+// LZSS parameters (4 KB window zero-filled, write position 0xFEE, 12-bit
+// offset + 4-bit length+3, 1 control byte = 8 LSB-first flags), which is the
+// same window layout the Tcx path drives, just fed raw bytes.
+//
 // Demo files (PS3 / Xbox 360 demo) are NOT compressed and pass straight through.
 
 class TcxDecompressor {
 public:
-    // Returns true if `data` starts with a Tcx-compressed stream.
+    enum class Codec {
+        None,          // already decompressed
+        Tcx,           // 256-byte freq table + arithmetic coder + LZSS
+        Lzss,          // bare LZSS stream, no arithmetic layer
+        LzssNulEaten,  // bare LZSS, but every 0x00 byte was replaced by 0x20
+    };
+
+    // LzssNulEaten marks a file damaged in transit: it is a valid LZSS stream
+    // whose NUL bytes have all become spaces (a text-mode transfer will do
+    // this). The damage is lossy - a space and an eaten NUL are no longer
+    // distinguishable - so such files cannot be decompressed, only recognised.
+    // Decompress() returns empty for them rather than emitting noise.
+    static const char* DescribeCodec(Codec c);
+
+    // Identifies which codec (if any) `data` is encoded with.
+    //
+    // Lzss is tested first and is the more specific test: we trial-decode the
+    // first 8 bytes and require a known magic plus a plausible embedded size.
+    // The Tcx test is only a frequency-table sanity check, which a bare LZSS
+    // stream would also pass, so order matters here.
+    static Codec DetectCodec(const uint8_t* data, size_t size);
+
+    // Returns true if `data` starts with a compressed stream of either codec.
     // The check is: if the first 4 bytes don't match any known uncompressed magic
-    // (BMD , BOP , NOBJ, NTX3, CSF , CAMP, PACK, AI-script 0x00000181, etc.)
+    // (BMD , BOP , NOBJ, NTX3, CSF , CXS , CAMP, PACK, AI-script 0x00000181, etc.)
     // and the file is large enough to hold a 256-byte freq table + body,
     // we assume compressed.
     static bool IsCompressed(const uint8_t* data, size_t size);
+
+    // Same test, reading only the file's first 260 bytes. Prefer this over
+    // loading a file just to find out whether it needs decompressing.
+    static bool IsFileCompressed(const std::string& path);
+
+    // DetectCodec against the file's first 260 bytes only.
+    static Codec DetectFileCodec(const std::string& path);
 
     // Decompresses `input` (the whole file contents, including 256-byte header)
     // and returns the decompressed bytes. On failure returns an empty vector.

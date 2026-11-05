@@ -19,6 +19,11 @@ struct P3Texture {
 
     std::string name; // texture filename from NTX2/TX2D, empty for NTX3
 
+    // Only meaningful when format == P3TEX_FORMAT_RGBA8_DECODED, where the
+    // original block format is otherwise no longer recoverable: true if the
+    // source was DXT5/BC3, i.e. full 8-bit alpha that needs GL_BLEND.
+    bool decoded_was_dxt5 = false;
+
     P3Texture() : offset(0), size(0), width(0), height(0), format(0) {}
 };
 

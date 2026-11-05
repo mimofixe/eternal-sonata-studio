@@ -2,6 +2,7 @@
 #include <glad/glad.h>
 #include <glm/glm.hpp>
 #include <vector>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <cfloat>
@@ -20,6 +21,8 @@ struct MeshGPUData {
     bool   draw_sequential = false;
     bool   needs_depth_offset = false;
     bool   has_vertex_alpha = false;
+    std::string name;                    // NSHP name, for the per-mesh toggle list
+    bool   visible = true;               // unchecked in the Meshes popup -> skipped
 
 };
 
@@ -64,6 +67,7 @@ private:
     void CleanupSkeletonGL();
     void FitCamera(glm::vec3 center, float extent);
     void UploadMeshToGPU(const NSHPMesh& mesh, MeshGPUData& out);
+    void DrawMeshVisibilityUI();     // "Meshes (n/N)" popup
 
     Camera  m_Camera;
     Shader* m_MeshShader = nullptr;
@@ -75,6 +79,8 @@ private:
     size_t m_IndexCount = 0;
     bool   m_HasMesh = false;
     bool   m_DrawSequential = false;
+    std::string m_MeshName;          // for the one-row Meshes list
+    bool   m_MeshVisible = true;
 
     // NMDL model
     std::vector<MeshGPUData>             m_ModelMeshes;
@@ -92,8 +98,8 @@ private:
     int    m_DotCount = 0;
     bool   m_HasSkeleton = false;
 
-    // UI toggles
-    bool m_ShowMesh = true;
+    // UI toggles. Mesh visibility is per-mesh (MeshGPUData::visible), driven by
+    // the Meshes popup, which replaced the old single "Mesh" checkbox.
     bool m_ShowSkeleton = true;
     bool m_FlipY = false;
     // Scene lighting state

@@ -2,12 +2,106 @@
 #include "NSHPParser.h"
 #include "NMDLLoader.h"
 #include "Cutscenescriptparser.h"
+#include "TcxDecompressor.h"
 #include <imgui.h>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <algorithm>
 #include "Viewport3D.h"
 #include "FileDialog.h"
 #include "Ntx3parser.h"
+#include "GltfExporter.h"
+
+bool ChunkInspector::LoadMapTextureArchive() {
+    std::string path = FileDialog::OpenFile(
+        "Texture Archives\0*.p3tex;*.x3tex\0P3TEX Files\0*.p3tex\0X3TEX Files\0*.x3tex\0All Files\0*.*\0");
+    if (path.empty()) return false;
+
+    // Xbox 360 .x3tex archives ship Tcx-compressed, same as .e/.bmd/.bop
+    // (see TcxDecompressor.h). P3TexParser scans for raw chunk magics, so
+    // a compressed archive silently yields zero textures unless decoded
+    // first - decompress to a temp file and point the parser at that.
+    bool was_compressed = false;
+    std::vector<uint8_t> bytes = TcxDecompressor::LoadAndMaybeDecompress(path, &was_compressed);
+    std::string load_path = path;
+    if (was_compressed) {
+        if (bytes.empty()) {
+            std::cerr << "[ChunkInspector] Failed to decompress " << path << "\n";
+            return false;
+        }
+        std::filesystem::path src(path);
+        std::filesystem::path tmp =
+            std::filesystem::temp_directory_path() /
+            (src.stem().string() + ".tcx_decompressed" + src.extension().string());
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
+        out.close();
+        load_path = tmp.string();
+    }
+
+    P3TexParser tempParser;
+    if (!tempParser.Load(load_path)) return false;
+
+    m_MapTextures.clear();
+    m_MapTexDXT5.clear();
+    // Upload all textures to GPU and collect their handles
+    for (size_t i = 0; i < tempParser.GetTextureCount(); i++) {
+        const P3Texture* tex = tempParser.GetTexture((uint8_t)i);
+        if (!tex || tex->width == 0 || tex->height == 0) {
+            m_MapTextures.push_back(0);
+            m_MapTexDXT5.push_back(false);
+            continue;
+        }
+        std::vector<uint8_t> rgba;
+        if (tex->format == P3TEX_FORMAT_RGBA8_DECODED) {
+            // Xbox 360 .x3tex: P3TexParser already untiled and
+            // decoded this to RGBA8 - decompressing it again as
+            // DXT would just read the pixel data as garbage.
+            rgba = tex->data;
+        }
+        else if ((tex->format & 0xDF) == 0x86)
+            rgba = P3TexParser::DecompressDXT1(
+                tex->data.data(), tex->width, tex->height);
+        else if (tex->format == 0xA5)
+            rgba = P3TexParser::DecompressRGBA8(
+                tex->data.data(), tex->width, tex->height);
+        else
+            rgba = P3TexParser::DecompressDXT5(
+                tex->data.data(), tex->width, tex->height);
+
+        GLuint glTex = 0;
+        if (!rgba.empty()) {
+            glGenTextures(1, &glTex);
+            glBindTexture(GL_TEXTURE_2D, glTex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                tex->width, tex->height, 0,
+                GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            // No mipmaps — atlas textures must not be mip-filtered.
+            // glGenerateMipmap on an atlas produces garbage mip levels
+            // which GL_LINEAR_MIPMAP_LINEAR then samples → rainbow artefacts.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                GL_REPEAT);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        m_MapTextures.push_back(glTex);
+        // Decided from the decoded alpha, not the source format: plenty of DXT5
+        // textures are fully opaque and must not go on the blend path. See
+        // NMDLLoader::NeedsAlphaBlend.
+        m_MapTexDXT5.push_back(NMDLLoader::NeedsAlphaBlend(rgba));
+    }
+    std::cout << "[ChunkInspector] Loaded " << m_MapTextures.size()
+        << " map textures from " << path << "\n";
+    return !m_MapTextures.empty();
+}
 
 ChunkInspector::ChunkInspector()
     : m_HasChunk(false), m_Viewport(nullptr), m_P3TexParser(nullptr),
@@ -25,6 +119,21 @@ void ChunkInspector::SetViewport(Viewport3D* viewport) {
 
 void ChunkInspector::SetP3TexParser(P3TexParser* parser) {
     m_P3TexParser = parser;
+}
+
+// Called once per file load, before any chunk is selected. The credits table
+// belongs to the file rather than to a chunk, and Application reuses a single
+// current_file_data vector for every file it opens - so this must be driven by
+// an explicit call. Keying a cache on the buffer's address would never
+// invalidate, leaving whichever file was opened first on screen forever.
+void ChunkInspector::SetFileContext(const std::vector<uint8_t>& file_data) {
+    m_CreditsSection = 0;
+    BmdCreditsParser::Parse(file_data.data(), file_data.size(), m_Credits);
+}
+
+void ChunkInspector::ClearFileContext() {
+    m_Credits = CreditsFile{};
+    m_CreditsSection = 0;
 }
 
 void ChunkInspector::SetChunk(const Chunk& chunk, const std::vector<uint8_t>& file_data) {
@@ -74,18 +183,20 @@ void ChunkInspector::SetChunk(const Chunk& chunk, const std::vector<uint8_t>& fi
 }
 
 void ChunkInspector::Render() {
-    if (!m_HasChunk) {
+    // File-scoped tabs stay available with nothing selected - a credits BMD has
+    // no meaningful chunks to click, so requiring a selection would hide it.
+    if (!m_HasChunk && !m_Credits.valid) {
         ImGui::TextDisabled("Select a chunk to inspect");
         return;
     }
 
     if (ImGui::BeginTabBar("InspectorTabs")) {
-        if (ImGui::BeginTabItem("Properties")) {
+        if (m_HasChunk && ImGui::BeginTabItem("Properties")) {
             RenderProperties();
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Hex View")) {
+        if (m_HasChunk && ImGui::BeginTabItem("Hex View")) {
             RenderHexView();
             ImGui::EndTabItem();
         }
@@ -135,7 +246,14 @@ void ChunkInspector::Render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Text View")) {
+        // File-level, not chunk-level: shown for any credits BMD regardless of
+        // which chunk happens to be selected.
+        if (m_Credits.valid && ImGui::BeginTabItem("Credits")) {
+            RenderCreditsInfo();
+            ImGui::EndTabItem();
+        }
+
+        if (m_HasChunk && ImGui::BeginTabItem("Text View")) {
             RenderTextView();
             ImGui::EndTabItem();
         }
@@ -409,6 +527,7 @@ void ChunkInspector::RenderNMDLInfo() {
 
     // ── Map texture loading ───────────────────────────────────────────────────
     int expected_tex_count = 0;
+    int embedded_tex_count = 0;
     if (m_FileData && m_ChunkData.size() >= 8) {
         auto u16be_fn = [](const uint8_t* d) { return uint16_t((d[0] << 8) | d[1]); };
         auto u32be_fn = [](const uint8_t* d) {
@@ -421,31 +540,58 @@ void ChunkInspector::RenderNMDLInfo() {
         while (p2 + 8 <= nmdl_end) {
             const uint8_t* pp = fd + p2;
             uint32_t s2 = u32be_fn(pp + 4);
-            if (s2 >= 8 && p2 + s2 <= nmdl_end) {
-                if (memcmp(pp, "NMTR", 4) == 0) {
-                    int mc = (int)((s2 - 8) / 96);
-                    int mx = -1;
-                    for (int m = 0; m < mc; m++) {
-                        const uint8_t* entry = pp + 8 + m * 96;
-                        if (u16be_fn(entry + 0x0A) == 1) {
-                            int idx = (int)u16be_fn(entry + 0x04);
-                            if (idx > mx) mx = idx;
-                        }
+            bool sane_size = (s2 >= 8 && p2 + s2 <= nmdl_end);
+
+            if (sane_size && memcmp(pp, "NMTR", 4) == 0) {
+                int mc = (int)((s2 - 8) / 96);
+                int mx = -1;
+                for (int m = 0; m < mc; m++) {
+                    const uint8_t* entry = pp + 8 + m * 96;
+                    if (u16be_fn(entry + 0x0A) == 1) {
+                        int idx = (int)u16be_fn(entry + 0x04);
+                        if (idx > mx) mx = idx;
                     }
-                    if (mx >= 0) expected_tex_count = mx + 1;
-                    break;
                 }
+                if (mx >= 0 && mx + 1 > expected_tex_count)
+                    expected_tex_count = mx + 1;
+                p2 += s2;
+                continue;
+            }
+            // Only trust the size field to skip a whole chunk when the magic
+            // is one NMDLLoader::Load itself recognizes (NTX3/NTX2/NTEX/NMTR/
+            // NSHP/NOBJ) - otherwise mesh/texture payload bytes can
+            // coincidentally look like a "plausible" size and jump straight
+            // over the real NMTR chunk, same as NMDLLoader::Load's own
+            // traversal guards against.
+            const bool is_tex_chunk = sane_size &&
+                (memcmp(pp, "NTX3", 4) == 0 || memcmp(pp, "NTX2", 4) == 0 ||
+                 memcmp(pp, "NTEX", 4) == 0);
+            if (is_tex_chunk) embedded_tex_count++;
+            if (is_tex_chunk ||
+                (sane_size && (memcmp(pp, "NSHP", 4) == 0 || memcmp(pp, "NOBJ", 4) == 0))) {
                 p2 += s2;
             }
-            else { p2 += 4; }
+            else {
+                p2 += 4;
+            }
         }
     }
 
-    ImGui::Text("Map textures (.p3tex):");
-    if (expected_tex_count > 0 && m_MapTextures.empty()) {
+    // A model only needs an external archive when it carries no texture
+    // chunks of its own. Xbox 360 maps embed their NTX2/NTEX textures, so
+    // asking for a .x3tex there is both pointless and actively harmful -
+    // an external list overrides the correctly-indexed embedded one.
+    const bool needs_archive = (expected_tex_count > 0 && embedded_tex_count == 0);
+
+    ImGui::Text("Map textures (.p3tex PS3 / .x3tex Xbox 360):");
+    if (needs_archive && m_MapTextures.empty()) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
-            "(needs p3tex with >= %d textures)", expected_tex_count);
+            "(needs an archive with >= %d textures)", expected_tex_count);
+    }
+    else if (embedded_tex_count > 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%d embedded - no archive needed)", embedded_tex_count);
     }
 
     if (!m_MapTextures.empty()) {
@@ -463,63 +609,17 @@ void ChunkInspector::RenderNMDLInfo() {
         ImGui::TextDisabled("none");
     }
 
-    if (ImGui::Button("Load .p3tex for this map...", ImVec2(-1, 0))) {
-        std::string path = FileDialog::OpenFile(
-            "P3TEX Files\0*.p3tex\0All Files\0*.*\0");
-        if (!path.empty()) {
-            P3TexParser tempParser;
-            if (tempParser.Load(path)) {
-                m_MapTextures.clear();
-                m_MapTexDXT5.clear();
-                // Upload all textures to GPU and collect their handles
-                for (size_t i = 0; i < tempParser.GetTextureCount(); i++) {
-                    const P3Texture* tex = tempParser.GetTexture((uint8_t)i);
-                    if (!tex || tex->width == 0 || tex->height == 0) {
-                        m_MapTextures.push_back(0);
-                        m_MapTexDXT5.push_back(false);
-                        continue;
-                    }
-                    std::vector<uint8_t> rgba;
-                    if ((tex->format & 0xDF) == 0x86)
-                        rgba = P3TexParser::DecompressDXT1(
-                            tex->data.data(), tex->width, tex->height);
-                    else
-                        rgba = P3TexParser::DecompressDXT5(
-                            tex->data.data(), tex->width, tex->height);
-
-                    GLuint glTex = 0;
-                    if (!rgba.empty()) {
-                        glGenTextures(1, &glTex);
-                        glBindTexture(GL_TEXTURE_2D, glTex);
-                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
-                            tex->width, tex->height, 0,
-                            GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-                        // No mipmaps — atlas textures must not be mip-filtered.
-                        // glGenerateMipmap on an atlas produces garbage mip levels
-                        // which GL_LINEAR_MIPMAP_LINEAR then samples → rainbow artefacts.
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                            GL_REPEAT);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                            GL_REPEAT);
-                        glBindTexture(GL_TEXTURE_2D, 0);
-                    }
-                    m_MapTextures.push_back(glTex);
-                    m_MapTexDXT5.push_back(tex->format != 0x86);
-                }
-                std::cout << "[ChunkInspector] Loaded " << m_MapTextures.size()
-                    << " map textures from " << path << "\n";
-            }
-        }
+    if (ImGui::Button("Load .p3tex / .x3tex for this map...", ImVec2(-1, 0))) {
+        LoadMapTextureArchive();
     }
 
     ImGui::Separator();
 
     // ── Load model button ─────────────────────────────────────────────────────
     if (ImGui::Button("Load Textured Model in Viewport", ImVec2(-1, 0))) {
+        // Loads with whatever textures are already mounted, and never opens a
+        // file dialog of its own. Mounting an archive is the separate button
+        // above; the hint next to "Map textures" says when a model wants one.
         if (m_FileData && !m_FileData->empty()) {
 
             // Scan file for NLIT chunk and extract scene lighting
@@ -602,10 +702,113 @@ void ChunkInspector::RenderNMDLInfo() {
         ImGui::EndPopup();
     }
 
+    // ── Export ────────────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(90);
+    ImGui::DragFloat("Scale##gltf", &m_ExportScale, 1.0f, 0.01f, 10000.0f, "x%.4g");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Game units put a whole character well under 1.0, where Blender's\n"
+            "bone widgets are bigger than the model and hide it. x100 puts a\n"
+            "character at a couple of metres. Applied to vertices, bones and\n"
+            "bind matrices alike, so the rig stays correct at any value.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export to glTF (Blender)...", ImVec2(-1, 0))) {
+        ExportNMDLToGltf();
+    }
+    if (!m_ExportStatus.empty()) {
+        ImGui::TextColored(m_ExportOk ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f)
+            : ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+            "%s", m_ExportStatus.c_str());
+    }
+
     if (m_Viewport->HasModel()) {
         ImGui::Spacing();
         if (ImGui::Button("Clear Model", ImVec2(-1, 0)))
             m_Viewport->ClearModel();
+    }
+}
+
+// Re-load the NMDL (so the export does not depend on what is currently in the
+// viewport) and write it out as glTF 2.0 alongside its textures.
+void ChunkInspector::ExportNMDLToGltf() {
+    m_ExportStatus.clear();
+    m_ExportOk = false;
+
+    if (!m_FileData || m_FileData->empty()) {
+        m_ExportStatus = "File data not available.";
+        return;
+    }
+
+    // A folder, not a filename: one export drops a .gltf, a .bin and one PNG per
+    // texture, so the user is choosing where that set lands rather than naming a
+    // single file. The base name comes from the model itself.
+    std::string dir = FileDialog::OpenFolder();
+    if (dir.empty()) return;   // cancelled
+
+    NMDLModel mdl;
+    const std::vector<GLuint>* extTex =
+        m_MapTextures.empty() ? nullptr : &m_MapTextures;
+    const std::vector<bool>* extDXT5ptr = nullptr;
+    if (extTex && !m_MapTexDXT5.empty()) extDXT5ptr = &m_MapTexDXT5;
+
+    if (!NMDLLoader::Load(m_FileData->data(), m_FileData->size(),
+        m_CurrentChunk.offset, mdl, extTex, extDXT5ptr)) {
+        m_ExportStatus = "NMDL failed to load - check the console.";
+        return;
+    }
+
+    // The skeleton is a sibling chunk inside this NMDL's own byte range, so the
+    // search is bounded by the chunk size rather than scanning the whole file:
+    // a map .e holds many models, and the first NBN2 in the file usually belongs
+    // to a different one.
+    std::vector<Bone> bones;
+    {
+        const uint8_t* fd = m_FileData->data();
+        const size_t   fsz = m_FileData->size();
+        const size_t   begin = m_CurrentChunk.offset;
+        size_t end = begin + m_CurrentChunk.size;
+        if (m_CurrentChunk.size == 0 || end > fsz) end = fsz;
+        for (size_t p = begin; p + 8 <= end; p += 4) {
+            if (memcmp(fd + p, "NBN2", 4) != 0) continue;
+            uint32_t sz = (uint32_t(fd[p + 4]) << 24) | (uint32_t(fd[p + 5]) << 16)
+                | (uint32_t(fd[p + 6]) << 8) | fd[p + 7];
+            if (sz < 8 || p + sz > end) break;
+            NBN2Parser::Parse(fd + p, sz, bones);
+            break;
+        }
+    }
+
+    // Prefer the NMDL's own name; fall back to the chunk label, then the offset,
+    // so two models from one file never collide on disk.
+    std::string base = mdl.name;
+    if (base.empty()) base = m_CurrentChunk.name;
+    if (base.empty()) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "nmdl_%08zx", m_CurrentChunk.offset);
+        base = buf;
+    }
+
+    GltfExportResult r = GltfExporter::Export(dir, base, mdl, bones, m_ExportScale);
+
+    // Textures were uploaded by this Load call and are not owned by the
+    // viewport, so release them; the export has already read the pixels back.
+    mdl.Destroy();
+
+    m_ExportOk = r.ok;
+    if (r.ok) {
+        m_ExportStatus = "Exported: " + r.message;
+        if (r.skipped_meshes > 0)
+            m_ExportStatus += " (" + std::to_string(r.skipped_meshes)
+            + " point-cloud meshes skipped)";
+        if (bones.empty())
+            m_ExportStatus += " - no NBN2 in this chunk, exported unskinned";
+        std::cout << "[glTF] " << r.gltf_path << ": " << m_ExportStatus << "\n";
+    }
+    else {
+        m_ExportStatus = "Export failed: " + r.message;
+        std::cerr << "[glTF] " << m_ExportStatus << "\n";
     }
 }
 
@@ -894,6 +1097,121 @@ void ChunkInspector::RenderMaterialInfo() {
         m_MaterialData.ambient_color[1] / 255.0f,
         m_MaterialData.ambient_color[2] / 255.0f, 1.0f);
     ImGui::ColorButton("Ambient", ambient, 0, ImVec2(50, 50));
+}
+
+void ChunkInspector::RenderCreditsInfo() {
+    ImGui::Text("Credits / Staff Roll");
+    ImGui::Separator();
+
+    const size_t populated = std::count_if(
+        m_Credits.sections.begin(), m_Credits.sections.end(),
+        [](const CreditSection& s) { return !s.records.empty() && !s.is_placeholder; });
+
+    ImGui::Text("Language slots: %zu   populated: %zu   records: %zu",
+        m_Credits.sections.size(), populated, m_Credits.TotalRecords());
+    ImGui::Spacing();
+
+    if (m_Credits.sections.empty()) return;
+
+    // Slot picker. Empty and placeholder slots stay selectable so the layout
+    // of an unfinished file (like the ab.bmd prototype) is still visible.
+    std::string preview = "Slot " + std::to_string(m_CreditsSection);
+    if (ImGui::BeginCombo("Language slot", preview.c_str())) {
+        for (size_t i = 0; i < m_Credits.sections.size(); ++i) {
+            const CreditSection& s = m_Credits.sections[i];
+            char label[96];
+            snprintf(label, sizeof(label), "Slot %zu - %zu records%s", i,
+                s.records.size(),
+                s.records.empty() ? "  (unused)"
+                : (s.is_placeholder ? "  (placeholder)" : ""));
+            if (ImGui::Selectable(label, m_CreditsSection == i)) m_CreditsSection = i;
+        }
+        ImGui::EndCombo();
+    }
+
+    if (m_CreditsSection >= m_Credits.sections.size()) m_CreditsSection = 0;
+    const CreditSection& sec = m_Credits.sections[m_CreditsSection];
+
+    if (sec.records.empty()) {
+        ImGui::Text("Section at 0x%zX", sec.offset);
+        ImGui::TextDisabled("This slot holds no record table.");
+        return;
+    }
+
+    ImGui::Text("Section at 0x%zX   string pool at 0x%zX   %s layout (%zu-byte records)",
+        sec.offset, sec.pool_offset,
+        sec.record_size == 12 ? "ending" : "opening", sec.record_size);
+    if (sec.is_placeholder) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+            "Every entry is empty - this language was never filled in.");
+    }
+
+    const bool is_ending = (sec.record_size == 12);
+
+    ImGui::Spacing();
+    ImGui::Checkbox("Show layout tags", &m_CreditsShowTags);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "<d24> <d32> <d48>  text size for what follows\n"
+            "\\n                 line break\n"
+            "<#nnn>             codepoint escape");
+    }
+    if (is_ending) {
+        ImGui::SameLine();
+        ImGui::Checkbox("Hide spacers", &m_CreditsHideSpacers);
+    }
+
+    ImGui::Spacing();
+    if (ImGui::BeginTable("CreditRecords", 4,
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+        // Opening records carry a line count; ending records carry the
+        // vertical advance in pixels for that scroll step.
+        ImGui::TableSetupColumn(is_ending ? "Adv" : "Lines",
+            ImGuiTableColumnFlags_WidthFixed, 46.0f);
+        ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+        ImGui::TableSetupColumn("Text", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        for (size_t i = 0; i < sec.records.size(); ++i) {
+            const CreditRecord& r = sec.records[i];
+            if (is_ending && m_CreditsHideSpacers && r.is_spacer) continue;
+
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%zu", i);
+
+            ImGui::TableSetColumnIndex(1);
+            if (r.param == 0xFFFFFFFFu) ImGui::TextDisabled("-");
+            else ImGui::Text("%u", r.param);
+
+            ImGui::TableSetColumnIndex(2);
+            if (r.is_spacer) ImGui::TextDisabled("-");
+            else ImGui::Text("0x%X", r.string_offset);
+
+            ImGui::TableSetColumnIndex(3);
+            if (r.is_spacer) {
+                ImGui::TextDisabled("(blank - %u px)", r.param);
+            }
+            else if (r.truncated) {
+                ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "<unterminated>");
+            }
+            else if (m_CreditsShowTags) {
+                ImGui::TextUnformatted(r.text.c_str());
+            }
+            else {
+                const std::string s = BmdCreditsParser::StripTags(r.text);
+                ImGui::TextUnformatted(s.c_str());
+            }
+        }
+        ImGui::EndTable();
+    }
 }
 
 void ChunkInspector::RenderNBN2Info() {

@@ -9,6 +9,9 @@ struct AppConfig {
     int height = 1080;
     std::string title = "Eternal Sonata Studio";
     bool vsync = true;
+    // Folder to open in the file browser at startup, from argv[1]. Empty means
+    // start with no folder, exactly as before (use File > Open Folder...).
+    std::string start_folder;
 };
 
 class Application {

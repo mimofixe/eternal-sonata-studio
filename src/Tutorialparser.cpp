@@ -11,44 +11,83 @@ uint32_t TutorialParser::ReadU32BE(const uint8_t* d) {
     return ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) | ((uint32_t)d[2] << 8) | d[3];
 }
 
+// Counts occurrences of a 4-byte magic in the buffer. Used only for the
+// scene-content test below, so a plain scan is fine.
+static uint32_t CountMagic(const uint8_t* data, size_t size, const char magic[4]) {
+    if (size < 4) return 0;
+    uint32_t n = 0;
+    for (size_t i = 0; i + 4 <= size; i++)
+        if (data[i] == uint8_t(magic[0]) && memcmp(data + i, magic, 4) == 0) n++;
+    return n;
+}
+
+// True when the buffer carries in-engine scene data (models, skeletons, animation,
+// cameras, textures). Tutorial files are audio + subtitles only and contain none.
+bool TutorialParser::HasSceneContent(const uint8_t* data, size_t size) {
+    static const char* kSceneMagics[] = {
+        "NSHP", "NMTN", "NCAM", "NOBJ", "NMDL", "NBN2", "NTX2", "NTX3"
+    };
+    uint32_t hits = 0;
+    for (const char* m : kSceneMagics) {
+        hits += CountMagic(data, size, m);
+        if (hits >= 4) return true;   // early out; see threshold note below
+    }
+    return hits >= 4;
+}
+
 bool TutorialParser::IsTutorialFile(const uint8_t* data, size_t size) {
     if (size < 0x18) return false;
     if (ReadU32BE(data + 0x00) != 0x00000181) return false;
     if (ReadU32BE(data + 0x10) != TUTORIAL_CODE_SIZE) return false;
 
-    // Scene .e files share the same magic and code_size.
-    // Tutorial files have a CSL audio table at 0x2000 with audio sections packed
-    // immediately after it.  We need three progressive checks:
-
     // 1. The 4 bytes at 0x2000 must be "CSL ".
     //    Scene files that have Mefc/NOBJ at 0x2000 (e.g. Tnk01.e) are rejected here.
-    if (size < 0x2004) return true;   // buffer too small to check further — accept tentatively
+    if (size < 0x2004) return false;
     if (memcmp(data + 0x2000, "CSL ", 4) != 0) return false;
 
-    // 2. The CSL declared size (at 0x2004) must be large enough to hold at least
-    //    one offset entry (magic + size + pad + 1 offset + terminator = 0x14).
-    //    Scene files can have a stub CSL of size 8 (e.g. e0041.e).
-    if (size < 0x2008) return true;
-    const uint32_t csl_size = ReadU32BE(data + 0x2004);
-    if (csl_size < 0x10) return false;
+    // 2. The u32 at 0x2004 is the section COUNT, not a byte size (t0001 = 24,
+    //    t0002 = 25, t0003 = 33). Only sanity-bound it. The old code required
+    //    it to be >= 0x10 "to hold one offset entry", which was both the wrong
+    //    interpretation of the field and an accidental filter.
+    if (size < 0x2008) return false;
+    const uint32_t section_count = ReadU32BE(data + 0x2004);
+    if (section_count == 0 || section_count > 4096) return false;
 
-    // 3. The first CSF-section offset stored in the CSL (at CSL+0x0C = 0x200C) must
-    //    point to a "nearby" section — tutorial audio sections are packed immediately
-    //    after the CSL table, so the offset is always small (< 0x4000).
-    //    Scene files have large offsets (e.g. e1141.e: first_offset=0xC000).
-    if (size < 0x2010) return true;
-    const uint32_t first_offset = ReadU32BE(data + 0x200C);
-    if (first_offset == 0 || first_offset >= 0x4000) return false;
+    // 3. Reject cutscene files. This is the part that actually separates the two,
+    //    and it cannot be done from the header alone.
+    //
+    //    Scene .e files share the magic, the 0x1FE8 code size, a "CSL " table at
+    //    0x2000, and CSF/ATRAC3 sections with LIP and SONG sub-chunks — the audio
+    //    container is identical in kind, so nothing in the CSL distinguishes them.
+    //    The old test assumed tutorial audio sat immediately after the CSL table
+    //    (first offset < 0x4000). That is false on the Xbox 360 retail build,
+    //    where the two ranges overlap completely: tutorials span 0xB000..0x26000
+    //    and scenes 0x0..0x24000, so the check rejected all three tutorials.
+    //
+    //    What does separate them is content: a tutorial is audio and subtitles
+    //    with no in-engine scene. Measured over all 678 .e files in the retail
+    //    build, 63 pass the header checks above; of those, exactly 3 contain zero
+    //    scene chunks (t0001/t0002/t0003) and the other 60 contain at least 7.
+    //    The threshold of 4 sits in that gap, leaving margin against a stray magic
+    //    appearing by chance inside several MB of ATRAC3 payload.
+    if (HasSceneContent(data, size)) return false;
 
     return true;
 }
 
 bool TutorialParser::IsTutorialFile(const std::string& filepath) {
+    // The scene-content test needs the whole file, not just a header: the chunks
+    // that mark a cutscene live well past 0x2000. Reading a short prefix here
+    // would classify every scene file as a tutorial.
     std::ifstream f(filepath, std::ios::binary);
     if (!f) return false;
-    uint8_t buf[0x18] = {};
-    f.read(reinterpret_cast<char*>(buf), sizeof(buf));
-    return IsTutorialFile(buf, sizeof(buf));
+    f.seekg(0, std::ios::end);
+    const std::streamoff len = f.tellg();
+    if (len <= 0) return false;
+    f.seekg(0);
+    std::vector<uint8_t> buf(static_cast<size_t>(len));
+    f.read(reinterpret_cast<char*>(buf.data()), len);
+    return IsTutorialFile(buf.data(), buf.size());
 }
 
 uint32_t TutorialParser::FindSequenceId(const std::vector<uint8_t>& data,

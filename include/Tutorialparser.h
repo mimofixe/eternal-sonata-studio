@@ -74,8 +74,11 @@ struct TutorialFile {
 
 class TutorialParser {
 public:
+    // Both require the COMPLETE file: telling a tutorial from a cutscene needs a
+    // scan for scene chunks, which live far past the header.
     static bool          IsTutorialFile(const uint8_t* data, size_t size);
     static bool          IsTutorialFile(const std::string& filepath);
+    static bool          HasSceneContent(const uint8_t* data, size_t size);
     static TutorialFile  Parse(const std::string& filepath);
     static bool          ExportSectionAT3(const TutorialSection& sec, const std::string& output_path);
     static int           ExportTrackAT3(const TutorialTrack& track, const std::string& base_dir, const std::string& prefix);

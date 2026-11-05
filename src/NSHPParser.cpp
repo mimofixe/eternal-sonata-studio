@@ -24,6 +24,15 @@ float NSHPParser::HalfToFloat(uint16_t h) {
     else            r = (s << 31) | ((e + 112u) << 23) | (m << 13);
     float f; std::memcpy(&f, &r, 4); return f;
 }
+// RSX CMP: signed normalized 11:11:10, x in the low 11 bits, z in the high 10.
+float NSHPParser::DecodeCMP(uint32_t packed, int comp) {
+    int32_t v; float scale;
+    if (comp == 0)      { v = int32_t(packed & 0x7FF);         if (v & 0x400) v -= 0x800; scale = 1023.f; }
+    else if (comp == 1) { v = int32_t((packed >> 11) & 0x7FF); if (v & 0x400) v -= 0x800; scale = 1023.f; }
+    else                { v = int32_t((packed >> 22) & 0x3FF); if (v & 0x200) v -= 0x400; scale = 511.f; }
+    return std::max(v / scale, -1.f);
+}
+
 float NSHPParser::DecodeNormal10_10_10(uint32_t packed, int comp) {
     int shift = 22 - comp * 10;
     int val = (packed >> shift) & 0x3FF;
@@ -51,15 +60,6 @@ void NSHPParser::TristripToTriangles(const uint16_t* strip, size_t len,
     flush();
 }
 
-// RSX CMP: signed normalized 11:11:10, x in the low 11 bits, z in the high 10.
-float NSHPParser::DecodeCMP(uint32_t packed, int comp) {
-    int32_t v; float scale;
-    if (comp == 0) { v = int32_t(packed & 0x7FF);         if (v & 0x400) v -= 0x800; scale = 1023.f; }
-    else if (comp == 1) { v = int32_t((packed >> 11) & 0x7FF); if (v & 0x400) v -= 0x800; scale = 1023.f; }
-    else { v = int32_t((packed >> 22) & 0x3FF); if (v & 0x200) v -= 0x400; scale = 511.f; }
-    return std::max(v / scale, -1.f);
-}
-
 void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
     uint16_t vc, int stride, bool skinned, NSHPMesh& out) {
     out.vertices.clear();
@@ -71,7 +71,37 @@ void NSHPParser::DecodeVertices(const uint8_t* data, size_t vstart,
         v.position[0] = ReadF32BE(vd + 0x00);
         v.position[1] = ReadF32BE(vd + 0x04);
         v.position[2] = ReadF32BE(vd + 0x08);
-        if (skinned) {
+        if (skinned && stride == 40) {
+            // Xbox 360 skinned layout (AppKeep.bmd party models, e.g. pcALG_v1).
+            // Four influences, but only three weights are stored: they are full
+            // f32 BE values and the fourth is derived as 1 - (w0+w1+w2). The four
+            // bone indices sit in the u32 that follows, in REVERSE byte order --
+            // +0x1B/+0x1A/+0x19/+0x18 map to weights 0/1/2/3. Reading them forwards
+            // puts every weight on the wrong bone, collapsing the mesh onto the root.
+            //   +0x0C/+0x10/+0x14  f32 BE weights 0..2   (w3 = 1 - sum)
+            //   +0x1B/+0x1A/+0x19/+0x18  bone indices for weights 0/1/2/3
+            //   +0x1C              packed normal (encoding not yet identified)
+            //   +0x20              RGBA vertex colour (A=0xFF, RGB grey)
+            //   +0x24              UV as an f16 pair (== stride - 4)
+            // Index 0 is a legal bone, so the fourth slot is always read rather than
+            // treated as padding: on 'face' 56 vertices carry a real fourth influence
+            // and on 'tasuki_sp' several of those land on bone 0.
+            v.bone_weights[0] = ReadF32BE(vd + 0x0C);
+            v.bone_weights[1] = ReadF32BE(vd + 0x10);
+            v.bone_weights[2] = ReadF32BE(vd + 0x14);
+            float w3 = 1.f - (v.bone_weights[0] + v.bone_weights[1] + v.bone_weights[2]);
+            v.bone_weights[3] = (w3 > 1e-4f) ? w3 : 0.f;
+            v.bone_ids[0] = vd[0x1B];
+            v.bone_ids[1] = vd[0x1A];
+            v.bone_ids[2] = vd[0x19];
+            v.bone_ids[3] = vd[0x18];
+            // Normal at +0x1C is neither 10:10:10:2 nor a signed-byte triple (both
+            // decode to non-unit magnitudes), so it is left for the viewer's
+            // geometric-normal fallback, same as the other skinned strides.
+            v.uv[0] = HalfToFloat(ReadU16BE(vd + 0x24));
+            v.uv[1] = HalfToFloat(ReadU16BE(vd + 0x26));
+        }
+        else if (skinned) {
             // PS3 skinned layout (RSX CMP packing, see the 360 recomp's PS3 asset
             // notes): +0x0C one CMP dword holding three weights, +0x10 UBYTE4 bone
             // indices, +0x14 CMP normal. CMP = signed 11:11:10, x in the low bits.
@@ -165,20 +195,61 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
         const float px1 = ReadF32BE(data + vstart + stride);
         if (std::isnan(px1) || std::isinf(px1) || std::abs(px1) > 10000.f) return false;
     }
+    // Two face-section layouts exist and both end at exactly the same offset,
+    // so they can only be told apart by where the per-section records sit:
+    //
+    //   contiguous  -- fc 16-byte records back to back, then all strips
+    //                  (the common case: .bop models, most .e map meshes)
+    //   interleaved -- each 16-byte record immediately followed by its own
+    //                  strip (e.g. the squirrel 'me' mesh in e0020_020.e)
+    //
+    // Record layout is identical in both: mat_id@+0, strip length@+14.
+    // Reading an interleaved mesh as contiguous picks up index data as if it
+    // were records, so the length at +14 is garbage and the chunk-end check
+    // fails -- which is what made 'me' report "failed to detect vertex format".
+    struct SecInfo { uint16_t mat_id; size_t idx_off; uint16_t count; };
+    std::vector<SecInfo> secs;
     uint32_t total_raw = 0;
-    for (uint16_t s = 0; s < fc; s++) {
-        uint16_t sc = ReadU16BE(data + fs_off + s * 16 + 14);
-        if (sc < 3 || sc > vc * 8u) return false;
-        total_raw += sc;
-    }
-    const size_t idx_end = fs_off + size_t(fc) * 16 + total_raw * 2;
-    if (idx_end > chunk_end || chunk_end - idx_end > 4) return false;
-    const size_t idx_base = fs_off + size_t(fc) * 16;
+
+    auto collect_contiguous = [&]() -> bool {
+        secs.clear(); total_raw = 0;
+        const size_t idx_base = fs_off + size_t(fc) * 16;
+        if (idx_base > chunk_end) return false;
+        size_t cursor = idx_base;
+        for (uint16_t s = 0; s < fc; s++) {
+            uint16_t sc = ReadU16BE(data + fs_off + s * 16 + 14);
+            if (sc < 3 || sc > vc * 8u) return false;
+            secs.push_back({ ReadU16BE(data + fs_off + s * 16), cursor, sc });
+            cursor += size_t(sc) * 2;
+            total_raw += sc;
+        }
+        return cursor <= chunk_end && chunk_end - cursor <= 4;
+        };
+    auto collect_interleaved = [&]() -> bool {
+        secs.clear(); total_raw = 0;
+        size_t cursor = fs_off;
+        for (uint16_t s = 0; s < fc; s++) {
+            if (cursor + 16 > chunk_end) return false;
+            uint16_t sc = ReadU16BE(data + cursor + 14);
+            if (sc < 3 || sc > vc * 8u) return false;
+            secs.push_back({ ReadU16BE(data + cursor), cursor + 16, sc });
+            cursor += 16 + size_t(sc) * 2;
+            if (cursor > chunk_end) return false;
+            total_raw += sc;
+        }
+        return chunk_end - cursor <= 4;
+        };
+
+    if (!collect_contiguous() && !collect_interleaved()) return false;
+
     uint16_t max_real = 0;
-    uint32_t sample = std::min(total_raw, uint32_t(200));
-    for (uint32_t i = 0; i < sample; i++) {
-        uint16_t v = ReadU16BE(data + idx_base + i * 2);
-        if (v != 0xFFFF) max_real = std::max(max_real, v);
+    uint32_t checked = 0;
+    for (const auto& sec : secs) {
+        for (uint16_t i = 0; i < sec.count && checked < 200; i++, checked++) {
+            uint16_t v = ReadU16BE(data + sec.idx_off + i * 2);
+            if (v != 0xFFFF) max_real = std::max(max_real, v);
+        }
+        if (checked >= 200) break;
     }
     if (max_real >= vc) return false;
     // Detect stride-24 UV mode from all vertex data before decoding.
@@ -187,21 +258,17 @@ bool NSHPParser::TryStride(const uint8_t* data, size_t chunk_end,
     out.vertex_stride = stride;
     out.faceSections.clear();
     out.indices.clear();
-    uint32_t cursor = 0;
     std::vector<uint16_t> raw;
     raw.reserve(total_raw);
-    for (uint32_t i = 0; i < total_raw; i++)
-        raw.push_back(ReadU16BE(data + idx_base + i * 2));
-    std::vector<uint16_t> raw_counts(fc);
-    for (uint16_t s = 0; s < fc; s++)
-        raw_counts[s] = ReadU16BE(data + fs_off + s * 16 + 14);
-    for (uint16_t s = 0; s < fc; s++) {
+    for (const auto& sec : secs) {
+        raw.clear();
+        for (uint16_t i = 0; i < sec.count; i++)
+            raw.push_back(ReadU16BE(data + sec.idx_off + i * 2));
         FaceSection fs;
-        fs.mat_id = ReadU16BE(data + fs_off + s * 16);
+        fs.mat_id = sec.mat_id;
         fs.index_start = static_cast<uint16_t>(out.indices.size());
-        TristripToTriangles(raw.data() + cursor, raw_counts[s], out.indices);
+        TristripToTriangles(raw.data(), raw.size(), out.indices);
         fs.index_count = static_cast<uint16_t>(out.indices.size() - fs.index_start);
-        cursor += raw_counts[s];
         out.faceSections.push_back(fs);
     }
 
@@ -280,8 +347,10 @@ bool NSHPParser::Parse(const uint8_t* data, size_t size, NSHPMesh& out) {
     bool parsed = false;
     if (out.has_bones) {
         // Skinned meshes are usually stride 32, but some (e.g. rope/cord "himo",
-        // polySurface) are stride 28. Try both; UV sits in the last 4 bytes.
-        for (int sst : { 32, 28 }) {
+        // polySurface) are stride 28, and the Xbox 360 party models in AppKeep.bmd
+        // use stride 40 (f32 weights + reversed index bytes). Try each; UV sits in
+        // the last 4 bytes for all three.
+        for (int sst : { 32, 40, 28 }) {
             if (TryStride(data, chunk_end, vdata_base, out.vertex_count,
                 out.face_section_count, sst, out)) {
                 DecodeVertices(data, vdata_base, out.vertex_count, sst, true, out);

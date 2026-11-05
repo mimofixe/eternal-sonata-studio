@@ -20,6 +20,7 @@
 struct SkinMeshGPU {
     GLuint VAO = 0, VBO = 0, EBO = 0;
     std::string name;                        // NSHP mesh name ("skirt", "body", ...)
+    bool   visible = true;                   // unchecked in the Meshes popup -> skipped
     size_t vertex_count = 0;
     size_t index_count = 0;
     bool   draw_sequential = false;
@@ -116,11 +117,17 @@ struct SkeletalModel {
 
     std::vector<Bone>      bind;
     std::vector<Bone>      anim;
-    // Rigid (animation-only) pose snapshot, taken at the top of ApplyClothPose;
-    // feeds u_SkinMatsRigid for the per-vertex cloth-vs-leg clamp in the shader.
+    // Rigid (animation-only) pose snapshot, refreshed by ApplyPose: the cloth
+    // targets and the collider spheres are taken from it.
     std::vector<Bone> rigidAnim;
     std::vector<glm::mat4> invBind;
-    std::unordered_map<std::string, int> boneIndex;
+    // Bone name -> every bone index carrying that name, in file order. Names are
+    // NOT unique: the e3120_110 seagull has two 'Jude_L' bones (20 and 22) and two
+    // 'Jude_R' (32 and 34), and its NMTN ships a matching pair of same-named
+    // tracks. A plain name->index map kept only the last of each, so both tracks
+    // landed on bone 22/34 and the wings' upper-arm bones were never animated at
+    // all. ApplyPose walks tracks in order and consumes the duplicates in order.
+    std::unordered_map<std::string, std::vector<int>> boneIndex;
 
     std::vector<SkinMeshGPU> meshes;
     std::vector<NMTNAnimation> anims;
@@ -217,6 +224,9 @@ private:
     void SettleDynamics(SkeletalModel& m, int steps); // settle for static preview
     void ResetDynamics(SkeletalModel& m);
 
+    // "Meshes (n/N)" popup. False when the model has no meshes and nothing was
+    // drawn, so the caller can skip its SameLine.
+    bool DrawMeshVisibilityUI(SkeletalModel& m);
     static void SetMat4Array(GLuint prog, const char* name,
         const glm::mat4* mats, int count);
 };

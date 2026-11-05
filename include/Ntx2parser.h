@@ -65,13 +65,17 @@ struct NTX2Info {
 //    height = ((W2 >> 13) & 0x1FFF) + 1
 //    format = W1 & 0x3F  → 18 = k_DXT1
 //
-//  Pixel data begins at the first 4 KB-aligned absolute address that is
-//  at least 0x1000 bytes past the chunk start:
-//    pix_abs   = (chunk_abs_offset + 0x1FFF) & ~0xFFF
+//  Pixel data begins at the first 4 KB-aligned ABSOLUTE address at or after the
+//  end of the XPR2 header block (the XPR2 magic sits at chunk + 0x08):
+//    pix_abs    = align4K(chunk_abs_offset + 0x08 + xpr2_hdr_sz)
 //    pix_offset = pix_abs - chunk_abs_offset
-//    pix_size   = hdr_sz - pix_offset
-//  For aligned chunks (chunk_abs_offset & 0xFFF == 0): pix_offset = 0x1000 (same as before).
-//  For misaligned chunks: pix_offset > 0x1000 (aligns to next 4 KB page).
+//    pix_size   = data_size          (the u32 at +0x10, an exact size)
+//  and the layout always satisfies  pix_offset + data_size == chunk_size.
+//
+//  Aligning up from chunk_start + 0x1000 instead of from the header end skips a
+//  whole 4 KB page whenever the header ends inside the chunk's first page, which
+//  renders the texture as a checkerboard of coherent rectangles rather than noise
+//  (the untiler permutes macro-tiles rather than scrambling bytes).
 class Ntx2Parser {
 public:
     // Parse the NTX2 header at data[0].  Returns false if magic is wrong or

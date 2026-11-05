@@ -55,8 +55,13 @@ add_executable(es_studio
     src/EFileTextExtractor.cpp
     src/CSFParser.cpp
     src/ATRAC3Writer.cpp
+    src/XMAWriter.cpp
+    src/CXSParser.cpp
+    src/BEWavParser.cpp
+    src/AudioPlayer.cpp
     src/CSFViewer.cpp
     src/ContainerParser.cpp
+    src/BmdCreditsParser.cpp
     src/NTX3Parser.cpp
     src/Texparser.cpp
     src/AIScriptParser.cpp
@@ -65,10 +70,12 @@ add_executable(es_studio
     src/Tutorialviewer.cpp
     src/Nbn2parser.cpp
     src/NMDLLoader.cpp
+    src/GltfExporter.cpp
     src/Ep3Parser.cpp
     src/Animviewport.cpp
     src/Nmtnparser.cpp
     src/Ntx2parser.cpp
+    src/Ntexparser.cpp
     src/TcxDecompressor.cpp
     src/Cutscenescriptparser.cpp
     src/Cutsceneviewport.cpp
@@ -84,6 +91,11 @@ target_link_libraries(es_studio PRIVATE
     glm::glm
     OpenGL::GL
 )
+
+# winmm provides PlaySound, used for CSF clip preview playback.
+if(WIN32)
+    target_link_libraries(es_studio PRIVATE winmm)
+endif()
 
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT es_studio)
 set_property(TARGET es_studio PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

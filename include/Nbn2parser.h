@@ -21,10 +21,12 @@
 //   +0x24   i16       rot2_x_fixed  Euler X (radians × 4096)  — SECONDARY rotation
 //   +0x26   i16       rot2_y_fixed  Euler Y                    overridden per-slot
 //   +0x28   i16       rot2_z_fixed  Euler Z                    by animation tracks
-//   +0x2A..0x2F       (6 bytes: scale always 1.0, then 2 zero bytes)
+//   +0x2A   i16       scale_x       local scale, fixed-point (256 = 1.0)
+//   +0x2C   i16       scale_y
+//   +0x2E   i16       scale_z
 //   +0x30   u16       ndyn_index    index into the NDYN 48-byte record array
-//                                   (EBOOT @0x2d1d88: lhz +0x30, ×48, + NDYN base;
-//                                   forms a 0..n-1 permutation over dynamic bones,
+//                                   (EBOOT @0x2d1d88: lhz +0x30, x48, + NDYN base;
+//                                   a 0..n-1 permutation over the dynamic bones,
 //                                   0 for rigid bones)
 //   +0x32   u16       (zero in pcalg/pcplk)
 //   +0x34   f32       local_x       position relative to parent
@@ -33,9 +35,18 @@
 //
 // Entry stride = 64 bytes.
 //
+// The scale is *not* cosmetic: it accumulates down the hierarchy and multiplies
+// every descendant offset, so ignoring it puts the rig in the wrong units (a
+// bone's own scale applies to its children, not to its own offset). It is 1.0
+// on 58844 of the 58889 bones across the 818 skeletons in the game, which is why
+// it went unnoticed — but e3120_110.e (the seagull) scales its root 'Top1' by
+// 31/256 = 0.121, i.e. its skeleton is authored ~8x larger than its mesh. Others:
+// Uns* 'joint1' 921/256 on X only, AppKeep 'Jhatpos' 6/256, Wau* 'joint26' 230/256.
+//
 // World positions are computed with Blender's BONESPACE algorithm:
-//   world_pos = parent_world_rot * local_pos + parent_world_pos
+//   world_pos = parent_world_rot * (parent_world_scale * local_pos) + parent_world_pos
 //   world_rot = parent_world_rot * (E(rot1) * E(rot2))
+//   world_scale = parent_world_scale * local_scale
 //
 // where E(rx,ry,rz).toMatrix() uses XYZ order (Rz*Ry*Rx). The bone's effective
 // local rotation is the composition E(rot1) * E(rot2). Animation tracks (NMTN)
@@ -60,10 +71,17 @@ struct Bone {
     float        local_x;       // local position
     float        local_y;
     float        local_z;
+    glm::vec3    local_scale;   // i16/256 triplet at +0x2A; (1,1,1) on almost every bone
 
     // Computed world-space bind pose (BONESPACE, set by ComputeWorldPositions)
     glm::vec3    world_pos;
     glm::mat3    world_rot;
+    // Accumulated scale (product down the parent chain). Applied to the child
+    // offsets only -- world_rot deliberately stays a pure rotation so that a
+    // skinning matrix (world * inverse(bind_world)) is rigid and a non-uniform
+    // scale can never shear the mesh. Nothing animates scale, so this is fixed
+    // at bind time and simply carried along by the pose.
+    glm::vec3    world_scale;
 
     bool IsRigid()    const { return flags == 96; }
     bool IsDynamic()  const { return flags == 355 || flags == 353; }

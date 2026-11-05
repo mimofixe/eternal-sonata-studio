@@ -267,7 +267,9 @@ bool CutsceneScene::LoadMap(const std::string& map_path, const std::string& p3te
             glBindTexture(GL_TEXTURE_2D, 0);
         }
         m_BankTextures.push_back(glTex);
-        m_BankDXT5.push_back(tex->format != 0x86);
+        // Decided from the decoded alpha, not the source format — see
+        // NMDLLoader::NeedsAlphaBlend.
+        m_BankDXT5.push_back(NMDLLoader::NeedsAlphaBlend(rgba));
     }
 
     // 2. Map file: main NMDL (the first one) with external textures + NLIT lighting

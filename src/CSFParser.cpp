@@ -1,8 +1,63 @@
 #include "CSFParser.h"
 #include "ATRAC3Writer.h"
+#include "XMAWriter.h"
 #include <fstream>
 #include <iostream>
 #include <cstring>
+
+const char* CSFCodecName(CSFCodec codec) {
+    return codec == CSFCodec::XMA2 ? "XMA2 (Xbox 360)" : "ATRAC3 (PS3)";
+}
+
+const char* CSFCodecExtension(CSFCodec codec) {
+    return codec == CSFCodec::XMA2 ? ".xma" : ".at3";
+}
+
+// The CSF container is byte-identical between the PS3 and Xbox 360 builds -
+// same "CSF "/BOOK/TIM framing, same big-endian fields, and the TIM format
+// word is 0 on both - so the codec has to be inferred from the payload.
+//
+// XMA2 is a stream of fixed 2048-byte packets, and the encoder pads every clip
+// out to a whole packet; ATRAC3 uses 192-byte frames and has no such
+// alignment. On top of the size test we sanity-check each packet header (a
+// big-endian dword whose top 6 bits are a frame count and whose bottom 8 are a
+// skip count), which is what rules out an ATRAC3 clip that happens to land on
+// a 2048-byte boundary. Verified against all 68 CSF chunks in the Xbox 360
+// campdata/scp.bmd: 3174/3174 packets pass, and every clip is packet-aligned
+// while only 25 of 68 are 192-aligned.
+CSFCodec CSFParser::DetectCodec(const CSFFile& csf) {
+    if (csf.clips.empty() || csf.audio_data.empty())
+        return CSFCodec::ATRAC3;
+
+    for (const CSFClip& clip : csf.clips) {
+        if (clip.size_bytes == 0 ||
+            clip.size_bytes % XMAWriter::PACKET_SIZE != 0 ||
+            clip.start_offset % XMAWriter::PACKET_SIZE != 0)
+            return CSFCodec::ATRAC3;
+    }
+
+    size_t checked = 0;
+    for (const CSFClip& clip : csf.clips) {
+        for (uint32_t off = 0; off + 4 <= clip.size_bytes;
+            off += XMAWriter::PACKET_SIZE) {
+            const size_t abs = size_t(clip.start_offset) + off;
+            if (abs + 4 > csf.audio_data.size())
+                return CSFCodec::ATRAC3;
+
+            const uint32_t hdr = ReadU32BE(&csf.audio_data[abs]);
+            const uint32_t frame_count = hdr >> 26;
+            const uint32_t skip_count = hdr & 0xFF;
+
+            // 0xFF is the "no frame starts in this packet" sentinel; anything
+            // else above 63 can't be a real count.
+            if (frame_count > 63 || (skip_count != 0xFF && skip_count > 63))
+                return CSFCodec::ATRAC3;
+            checked++;
+        }
+    }
+
+    return checked > 0 ? CSFCodec::XMA2 : CSFCodec::ATRAC3;
+}
 
 uint32_t CSFParser::ReadU32BE(const uint8_t* data) {
     return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
@@ -136,6 +191,8 @@ bool CSFParser::Load(const std::string& filepath, CSFFile& out) {
         out.audio_data.resize(audio_size);
         memcpy(out.audio_data.data(), &buffer[out.audio_start], audio_size);
         std::cout << "Extracted audio: " << audio_size << " bytes" << std::endl;
+        out.codec = DetectCodec(out);
+        std::cout << "Codec: " << CSFCodecName(out.codec) << std::endl;
     }
     else {
         std::cerr << "Invalid audio_start" << std::endl;
@@ -175,6 +232,7 @@ bool CSFParser::LoadFromMemory(const uint8_t* data, size_t size, CSFFile& out) {
         size_t audio_size = size - out.audio_start;
         out.audio_data.resize(audio_size);
         memcpy(out.audio_data.data(), &data[out.audio_start], audio_size);
+        out.codec = DetectCodec(out);
     }
     else {
         out.valid = false;
@@ -184,33 +242,58 @@ bool CSFParser::LoadFromMemory(const uint8_t* data, size_t size, CSFFile& out) {
     return true;
 }
 
-// Export single clip as valid AT3 file with RIFF/WAVE container
-bool CSFParser::ExportClipAT3(const CSFFile& csf, uint32_t clip_index, const std::string& output_path) {
+// Bounds-check a clip against the audio section and copy its payload out
+bool CSFParser::SliceClip(const CSFFile& csf, uint32_t clip_index,
+    std::vector<uint8_t>& payload_out) {
     if (!csf.valid || clip_index >= csf.clips.size()) {
         return false;
     }
 
     const CSFClip& clip = csf.clips[clip_index];
 
-    if (clip.start_offset + clip.size_bytes > csf.audio_data.size()) {
+    if (size_t(clip.start_offset) + clip.size_bytes > csf.audio_data.size()) {
         std::cerr << "Clip data out of bounds" << std::endl;
         return false;
     }
 
-    // Extract raw ATRAC3 payload
-    std::vector<uint8_t> payload(csf.audio_data.begin() + clip.start_offset,
+    payload_out.assign(csf.audio_data.begin() + clip.start_offset,
         csf.audio_data.begin() + clip.start_offset + clip.size_bytes);
+    return true;
+}
+
+// Export single clip as valid AT3 file with RIFF/WAVE container
+bool CSFParser::ExportClipAT3(const CSFFile& csf, uint32_t clip_index, const std::string& output_path) {
+    std::vector<uint8_t> payload;
+    if (!SliceClip(csf, clip_index, payload)) return false;
 
     // ATRAC3 parameters for Eternal Sonata voice clips
-    uint32_t sample_rate = clip.sample_rate;
+    uint32_t sample_rate = csf.clips[clip_index].sample_rate;
     uint16_t channels = 1;         // Mono
     uint16_t block_align = 0xC0;   // 192 bytes per frame
 
     return ATRAC3Writer::WriteAT3File(payload, sample_rate, channels, block_align, output_path);
 }
 
+// Export single clip as an XMA2 RIFF (Xbox 360)
+bool CSFParser::ExportClipXMA(const CSFFile& csf, uint32_t clip_index, const std::string& output_path) {
+    std::vector<uint8_t> payload;
+    if (!SliceClip(csf, clip_index, payload)) return false;
+
+    // Every Xbox 360 CSF clip observed is a single mono 48 kHz stream; the
+    // rate still comes from the TIM descriptor rather than being hardcoded.
+    return XMAWriter::WriteXMAFile(payload, csf.clips[clip_index].sample_rate,
+        1, output_path);
+}
+
+bool CSFParser::ExportClip(const CSFFile& csf, uint32_t clip_index, const std::string& output_path) {
+    return csf.codec == CSFCodec::XMA2
+        ? ExportClipXMA(csf, clip_index, output_path)
+        : ExportClipAT3(csf, clip_index, output_path);
+}
+
 // Export all clips with naming pattern: base_000.at3, base_001.at3, etc.
-bool CSFParser::ExportAllClipsAT3(const CSFFile& csf, const std::string& base_path) {
+// (or _000.xma ... for Xbox 360 containers)
+bool CSFParser::ExportAllClips(const CSFFile& csf, const std::string& base_path) {
     if (!csf.valid) {
         return false;
     }
@@ -225,10 +308,11 @@ bool CSFParser::ExportAllClipsAT3(const CSFFile& csf, const std::string& base_pa
         }
 
         char num_buf[16];
-        snprintf(num_buf, sizeof(num_buf), "_%03d.at3", (int)i);
+        snprintf(num_buf, sizeof(num_buf), "_%03d", (int)i);
         filename += num_buf;
+        filename += CSFCodecExtension(csf.codec);
 
-        if (ExportClipAT3(csf, i, filename)) {
+        if (ExportClip(csf, (uint32_t)i, filename)) {
             success_count++;
         }
     }

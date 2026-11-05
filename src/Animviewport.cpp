@@ -45,15 +45,6 @@ void main() {
             + mat3(u_SkinMats[aBoneIds.w]) * w.w;
     Normal      = normalize(nm * aNormal);
     TexCoord    = aUV;
-    // Cloth-vs-leg vertex clamp (skirt only): ABSOLUTE per-capsule rule. A cloth
-    // vertex may never sit inside a leg capsule (per-segment radius: thigh/shin).
-    // The authored run animation itself places skirt vertices inside the leg
-    // (measured 0.001 from the axis); the real game visibly pushes the hem out
-    // past the authored pose, so the rule must be absolute, not relative to the
-    // animation. Covers the mesh BETWEEN cloth bones, which bone-level collision
-    // cannot reach. Two iterations resolve most capsule-vs-capsule interplay;
-    // vertices pinched between crossing thighs end on the nearest leg's surface
-    // (same as the engine: the cloth cannot be outside both legs at once).
     gl_Position = u_Proj * u_View * skinPos;
 }
 )";
@@ -320,7 +311,7 @@ void AnimViewport::BuildGroups(const std::vector<uint8_t>& fdv,
         m.name = host->name.empty() ? "model" : host->name;
         if (!NBN2Parser::Parse(fd + sk->offset, sk->size, m.bind) || m.bind.empty())
             continue;
-        for (int i = 0; i < (int)m.bind.size(); ++i) m.boneIndex[m.bind[i].name] = i;
+        for (int i = 0; i < (int)m.bind.size(); ++i) m.boneIndex[m.bind[i].name].push_back(i);
         BuildInvBind(m);
 
         load_meshes(m, host->start);
@@ -342,7 +333,7 @@ void AnimViewport::BuildGroups(const std::vector<uint8_t>& fdv,
             SkeletalModel m;
             m.name = "model";
             if (NBN2Parser::Parse(fd + sk->offset, sk->size, m.bind) && !m.bind.empty()) {
-                for (int i = 0; i < (int)m.bind.size(); ++i) m.boneIndex[m.bind[i].name] = i;
+                for (int i = 0; i < (int)m.bind.size(); ++i) m.boneIndex[m.bind[i].name].push_back(i);
                 BuildInvBind(m);
                 if (!nmdl.empty()) load_meshes(m, nmdl.front().start);
                 for (const Chunk* a : nmtn) add_anim(m, a);
@@ -419,10 +410,20 @@ void AnimViewport::ApplyPose(SkeletalModel& m, float frame) {
         local_rot[i] = r1 * r2;
     }
 
+    // Bone names are not unique (see SkeletalModel::boneIndex). Tracks and bones
+    // are both stored in the exporter's traversal order, so the Nth track named X
+    // belongs to the Nth bone named X: count occurrences as we walk. For the
+    // overwhelmingly common unique-name case this is just a plain lookup.
+    std::unordered_map<std::string, size_t> seen;
+
     for (const auto& track : anim.tracks) {
         auto it = m.boneIndex.find(track.bone_name);
         if (it == m.boneIndex.end()) continue;
-        const int idx = it->second;
+        const std::vector<int>& cands = it->second;
+        const size_t occ = seen[track.bone_name]++;
+        // More same-named tracks than bones: the surplus has no bone to drive.
+        if (occ >= cands.size()) continue;
+        const int idx = cands[occ];
         const Bone& b = m.anim[idx];
 
         const int pos_slot[3] = { 0, 1, 2 };
@@ -455,8 +456,15 @@ void AnimViewport::ApplyPose(SkeletalModel& m, float frame) {
             b.world_rot = local_rot[i];
         }
         else {
+            // Same parent-scale division as NBN2Parser::ComputeWorldPositions --
+            // NMTN position channels are authored in the bone's own local units, so
+            // they need the accumulated scale exactly like the bind offsets do.
+            // Without it a scaled rig (e.g. the e3120_110 seagull, root scale 0.121)
+            // poses ~8x too large: the skeleton still looks self-consistent, but every
+            // skinning matrix then carries an 8x-oversized translation and shreds the
+            // mesh. world_scale is static, carried over by the `m.anim = m.bind` copy.
             const Bone& p = m.anim[par];
-            b.world_pos = p.world_rot * local_pos[i] + p.world_pos;
+            b.world_pos = p.world_rot * (p.world_scale * local_pos[i]) + p.world_pos;
             b.world_rot = p.world_rot * local_rot[i];
         }
     }
@@ -464,8 +472,7 @@ void AnimViewport::ApplyPose(SkeletalModel& m, float frame) {
     // Snapshot the rigid (animation-only) pose. Taken HERE (not in
     // ApplyClothPose) so it refreshes on EVERY path that re-poses the model:
     // playback ticks, the frame-slider scrub while paused, and load. The cloth
-    // overlay and the shader leg clamp both rely on this being current; a stale
-    // snapshot leaves the leg-clamp capsules at an old pose (invisible failure).
+    // overlay relies on this being current (targets and colliders follow it).
     m.rigidAnim = m.anim;
 }
 
@@ -495,6 +502,56 @@ void AnimViewport::RebuildSkeletonLines(SkeletalModel& m) {
     m.lineVerts = (int)lines.size();
 }
 
+// Per-mesh visibility control, matching the 3D Viewport's. A model is often a
+// dozen or more NSHP chunks and isolating one is the only way to tell which is
+// which -- particularly here, where it also answers which mesh a bad weight or
+// a stray cloth bone belongs to. Kept in a popup so a long list never eats the
+// viewport's vertical space.
+// Returns false when there was nothing to draw, so the caller can skip the
+// SameLine that would otherwise continue a row this never started.
+bool AnimViewport::DrawMeshVisibilityUI(SkeletalModel& M) {
+    if (M.meshes.empty()) return false;
+    size_t shown = 0;
+    for (const auto& g : M.meshes) if (g.visible) shown++;
+    char lbl[64];
+    snprintf(lbl, sizeof(lbl), "Meshes (%zu/%zu)###animmeshlist",
+        shown, M.meshes.size());
+    if (ImGui::SmallButton(lbl)) ImGui::OpenPopup("##animmeshvis");
+    if (ImGui::BeginPopup("##animmeshvis")) {
+        if (ImGui::SmallButton("All")) { for (auto& g : M.meshes) g.visible = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("None")) { for (auto& g : M.meshes) g.visible = false; }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(right-click list item to solo)");
+        ImGui::Separator();
+        // Cap the height so a many-mesh model scrolls instead of growing a
+        // popup taller than the window.
+        if (ImGui::BeginChild("##animmeshvislist",
+            ImVec2(300.f, std::min<float>(320.f,
+                M.meshes.size() * ImGui::GetFrameHeightWithSpacing() + 4.f)))) {
+            for (size_t i = 0; i < M.meshes.size(); i++) {
+                auto& g = M.meshes[i];
+                // Names are not unique (and can be empty), so the index both
+                // disambiguates the ImGui id and identifies the mesh.
+                snprintf(lbl, sizeof(lbl), "%zu: %s##amv%zu", i,
+                    g.name.empty() ? "(unnamed)" : g.name.c_str(), i);
+                ImGui::Checkbox(lbl, &g.visible);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    for (size_t k = 0; k < M.meshes.size(); k++)
+                        M.meshes[k].visible = (k == i);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%zu verts, %zu sections, %zu bones",
+                        g.vertex_count, g.sections.size(), g.bone_id_list.size());
+                }
+            }
+        }
+        ImGui::EndChild();
+        ImGui::EndPopup();
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Cloth dynamics (Dynabone) - see the format notes in Animviewport.h.
 //
@@ -512,6 +569,23 @@ namespace {
     constexpr int    kMaxBodies = 17;           // root + 16 point masses
     constexpr double kDragCoef = 0.0375;        // 1.2 * 3 / (400 * 0.03 * 8) per unit of NDYN +0x0C
 }
+
+// A bone is simulated when its NBN2 flag word has anything set above the low
+// byte (0x100 and/or 0x200). Rigid bones only ever use the low-byte vocabulary:
+//
+//   rigid  0x00 0x40 0x60 0x80 0xC0 0xE0
+//   dyn    0x161 0x163 0x165 0x167 0x169 0x16D 0x261 0x263 0x269 0x36B 0x36F
+//
+// This used to test `flags != 96 && flags != 224`, i.e. it hardcoded 0x60/0xE0
+// as the only rigid values. Party skeletons happen to use exactly those, so it
+// looked correct — but plenty of models (the e0020_020.e squirrel etc21_v1, and
+// every NPC/prop skeleton in the Adg/Agn/Atn maps) use the 0x40/0xC0 or 0x00/
+// 0x80 vocabulary instead. There the old test matched *every* bone, so enabling
+// Cloth turned the whole skeleton — hips, spine, head — into free-hanging Verlet
+// chains: the model stopped following the animation and collapsed on itself.
+// Checked over 139 skeletons: the two rules agree on all 48 that have real
+// dynamic bones, and the 27 they disagree on are all the 100%-dynamic bug case.
+static inline bool AVIsDynamicBone(uint16_t flags) { return flags >= 0x100; }
 
 // Parse NBN2 topology + NDYN + NCLS for this model's region.
 void AnimViewport::ParseDynamics(SkeletalModel& m, const std::vector<uint8_t>& fd,
@@ -531,7 +605,7 @@ void AnimViewport::ParseDynamics(SkeletalModel& m, const std::vector<uint8_t>& f
     const uint8_t* d = fd.data();
 
     // --- topology ---------------------------------------------------------
-    auto dynFlag = [&](int i) { return m.bind[i].flags != 96 && m.bind[i].flags != 224; };
+    auto dynFlag = [&](int i) { return AVIsDynamicBone(m.bind[i].flags); };
     std::vector<std::vector<int>> kids(N);
     std::vector<int> roots;
     size_t nDyn = 0;
@@ -906,7 +980,7 @@ void AnimViewport::CollideChain(SkeletalModel& m, ClothChain& c, bool keepIn, fl
         else {                                             // keep-in: stop
             for (int k = j; k < n; ++k) c.v[k] = glm::vec3(0.f);
         }
-        };
+    };
     if (keepIn) {                                          // 0x82137510
         for (int j = 1; j < n; ++j)
             for (int k : m.cloth[c.bones[j]].keepIn) {
@@ -1058,7 +1132,7 @@ void AnimViewport::SolveSheets(SkeletalModel& m) {
                 if (!lk || lk->rest <= 0.f) continue;
                 AVSheetReach(B, j, C.x[lk->node], lk->weight * lk->rest);
             }
-            };
+        };
         for (int k = lead; k > 0; --k) pull(k, k - 1);
         for (int k = lead; k < cnt - 1; ++k) pull(k, k + 1);
         const ClothChain& L = m.chains[sh.chains[lead]];
@@ -1158,7 +1232,7 @@ void AnimViewport::StepDynamics(SkeletalModel& m, float dt) {
     AVPoseCloth(m, true, [&](ClothChain& c) {
         SolveChain(m, c, dt);
         CollideChain(m, c, true, dt);
-        });
+    });
     SolveSheets(m);
     for (ClothChain& c : m.chains) CollideChain(m, c, false, dt);
     AVPoseCloth(m, false, nullptr);   // final pose from the chain states
@@ -1316,15 +1390,18 @@ void AnimViewport::Render() {
             ImGui::PopItemWidth();
         }
         int nclo = 0; for (const auto& cb : M.cloth) if (cb.isDyn) ++nclo;
-        ImGui::Text("Bones: %d   Meshes: %d   Textures: %d   Cloth bones: %d",
-            (int)M.bind.size(), (int)M.meshes.size(), (int)M.matToTex.size(), nclo);
+        if (DrawMeshVisibilityUI(M)) ImGui::SameLine();
+        // Mesh count omitted: the Meshes button already reads "(shown/total)".
+        ImGui::Text("Bones: %d   Textures: %d   Cloth bones: %d",
+            (int)M.bind.size(), (int)M.matToTex.size(), nclo);
     }
     else {
         ImGui::TextDisabled("No NMTN animations found for this model.");
         ImGui::Checkbox("Textured", &m_Textured);
         ImGui::SameLine();
         ImGui::Checkbox("Skeleton", &m_ShowSkel);
-        ImGui::Text("Bones: %d   Meshes: %d", (int)M.bind.size(), (int)M.meshes.size());
+        if (DrawMeshVisibilityUI(M)) ImGui::SameLine();
+        ImGui::Text("Bones: %d", (int)M.bind.size());
     }
 
     ImGui::Separator();
@@ -1382,7 +1459,7 @@ void AnimViewport::Render() {
         const auto& pose = M.anim.empty() ? M.bind : M.anim;
 
         for (const auto& mesh : M.meshes) {
-            if (!mesh.VAO || mesh.bone_id_list.empty()) continue;
+            if (!mesh.VAO || !mesh.visible || mesh.bone_id_list.empty()) continue;
 
             int n_local = std::min((int)mesh.bone_id_list.size(), 64);
             glm::mat4 skin_mats[64];

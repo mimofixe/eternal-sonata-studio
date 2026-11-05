@@ -1,4 +1,5 @@
 ﻿#include "FileSystemBrowser.h"
+#include "FileDialog.h"
 #include <imgui.h>
 #include <algorithm>
 
@@ -88,7 +89,12 @@ void FileSystemBrowser::RenderNode(const FileEntry& entry) {
 void FileSystemBrowser::Render() {
     if (m_Root.path.empty()) {
         ImGui::TextDisabled("No folder loaded");
+        // Same action as File > Open Folder... in the main menu bar.
         if (ImGui::Button("Select Folder...")) {
+            std::string folder = FileDialog::OpenFolder();
+            if (!folder.empty()) {
+                SetRootPath(folder);
+            }
         }
         return;
     }

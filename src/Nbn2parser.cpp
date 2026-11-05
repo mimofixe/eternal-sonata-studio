@@ -86,12 +86,16 @@ bool NBN2Parser::Parse(const uint8_t* data, size_t size, std::vector<Bone>& out)
         bone.rot2_x = ReadI16BE(b + 0x24) / 4096.0f;  // rot2: secondary rotation
         bone.rot2_y = ReadI16BE(b + 0x26) / 4096.0f;
         bone.rot2_z = ReadI16BE(b + 0x28) / 4096.0f;
+        bone.local_scale = glm::vec3(ReadI16BE(b + 0x2A) / 256.0f,   // fixed-point, 256 = 1.0
+            ReadI16BE(b + 0x2C) / 256.0f,
+            ReadI16BE(b + 0x2E) / 256.0f);
         bone.ndyn_index = ReadU16BE(b + 0x30);        // NDYN record index (dynamic bones)
         bone.local_x = ReadF32BE(b + 0x34);
         bone.local_y = ReadF32BE(b + 0x38);
         bone.local_z = ReadF32BE(b + 0x3C);
         bone.world_pos = glm::vec3(0.f);
         bone.world_rot = glm::mat3(1.f);
+        bone.world_scale = glm::vec3(1.f);
 
         out.push_back(std::move(bone));
     }
@@ -131,11 +135,15 @@ void NBN2Parser::ComputeWorldPositions(std::vector<Bone>& bones) {
             // Root bone: world = local
             bone.world_pos = lp;
             bone.world_rot = lr;
+            bone.world_scale = bone.local_scale;
         }
         else {
+            // The parent's accumulated scale multiplies this bone's offset -- this
+            // is what puts the rig in the same units as the mesh (see NBN2Parser.h).
             const Bone& p = bones[par];
-            bone.world_pos = p.world_rot * lp + p.world_pos;
+            bone.world_pos = p.world_rot * (p.world_scale * lp) + p.world_pos;
             bone.world_rot = p.world_rot * lr;
+            bone.world_scale = p.world_scale * bone.local_scale;
         }
     }
 }

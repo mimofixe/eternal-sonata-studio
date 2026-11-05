@@ -12,6 +12,8 @@ namespace {
     constexpr uint32_t MAGIC_NTX2 = 0x4E545832; // "NTX2"
     constexpr uint32_t MAGIC_NTEX = 0x4E544558; // "NTEX"
     constexpr uint32_t MAGIC_CSF = 0x43534620; // "CSF "
+    constexpr uint32_t MAGIC_CXS = 0x43585320; // "CXS "
+    constexpr uint32_t MAGIC_RIFF = 0x52494646; // "RIFF" (the big-endian WAVs)
     constexpr uint32_t MAGIC_CAMP = 0x43414D50; // "CAMP"
     constexpr uint32_t MAGIC_SCP = 0x53435020; // "SCP "
     constexpr uint32_t MAGIC_PACK = 0x5041434B; // "PACK"
@@ -34,6 +36,8 @@ namespace {
         case MAGIC_NTX2:
         case MAGIC_NTEX:
         case MAGIC_CSF:
+        case MAGIC_CXS:
+        case MAGIC_RIFF:
         case MAGIC_CAMP:
         case MAGIC_SCP:
         case MAGIC_PACK:
@@ -61,6 +65,118 @@ namespace {
         default:
             return 0;
         }
+    }
+
+    // Bare LZSS, no arithmetic layer: the stream is a run of groups, each a
+    // control byte followed by its 8 items. A set flag (LSB first) means one
+    // literal byte; a clear flag means a 2-byte back-reference into the 4 KB
+    // window - offset low byte, then (offset high nibble << 4) | (length - 3).
+    //
+    // `target` caps the output; 0 means "run until the input is exhausted".
+    // A back-reference is always copied whole, so the result can overshoot
+    // `target` by up to 17 bytes and callers are expected to trim.
+    static std::vector<uint8_t> DecodeLzss(const uint8_t* in, size_t in_size,
+        size_t target) {
+        std::vector<uint8_t> out;
+        if (target) out.reserve(target);
+
+        uint8_t dict[4096] = { 0 };
+        uint16_t dpos = 0xFEE;
+        size_t i = 0;
+
+        while (i < in_size) {
+            const uint8_t ctrl = in[i++];
+            for (int bit = 0; bit < 8; ++bit) {
+                if (target && out.size() >= target) return out;
+                if (i >= in_size) return out;
+
+                if (ctrl & (1u << bit)) {
+                    const uint8_t c = in[i++];
+                    out.push_back(c);
+                    dict[dpos] = c;
+                    dpos = (dpos + 1) & 0xFFF;
+                }
+                else {
+                    if (i + 1 >= in_size) return out;
+                    const uint8_t lo = in[i++];
+                    const uint8_t hi = in[i++];
+                    const uint32_t length = (uint32_t)(hi & 0x0F) + 3;
+                    const uint32_t offset =
+                        ((((uint32_t)(hi & 0xF0)) << 4) | lo) & 0xFFF;
+                    for (uint32_t k = 0; k < length; ++k) {
+                        const uint8_t v = dict[(offset + k) & 0xFFF];
+                        out.push_back(v);
+                        dict[dpos] = v;
+                        dpos = (dpos + 1) & 0xFFF;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    // Trial-decodes just the 8-byte header of a candidate LZSS stream.
+    // Returns false unless it yields a known magic; on success `out_size` gets
+    // the format's embedded decompressed size (0 if the format has none).
+    static bool ProbeLzss(const uint8_t* data, size_t size, uint32_t* out_size) {
+        // 8 output bytes need at most 9 input bytes (all literals).
+        const size_t probe_in = size < 16 ? size : 16;
+        std::vector<uint8_t> head = DecodeLzss(data, probe_in, 8);
+        if (head.size() < 8) return false;
+
+        const uint32_t magic = LoadBE32(head.data());
+        if (!IsKnownUncompressedMagic(magic)) return false;
+
+        const uint32_t embedded = EmbeddedSizeForMagic(magic, head.data(), head.size());
+        // Formats without an embedded size are still valid; reject only sizes
+        // that are present but implausible.
+        if (embedded != 0 && (embedded < 16 || embedded > (256u << 20))) return false;
+
+        if (out_size) *out_size = embedded;
+        return true;
+    }
+
+    // Detects an LZSS stream whose NUL bytes were all replaced by 0x20.
+    // Two independent signals have to agree, which keeps this from firing on
+    // healthy files: the stream must contain no NUL at all (a real compressed
+    // stream of any size always does), and undoing the substitution on the
+    // header must produce a known magic.
+    static bool ProbeLzssNulEaten(const uint8_t* data, size_t size) {
+        // Signal 1: not a single NUL anywhere. Any real compressed stream of
+        // this size has some, so their total absence is the damage itself.
+        const size_t scan = size < 4096 ? size : 4096;
+        bool saw_space = false;
+        for (size_t i = 0; i < scan; ++i) {
+            if (data[i] == 0x00) return false;
+            if (data[i] == 0x20) saw_space = true;
+        }
+        if (!saw_space) return false;
+
+        // Signal 2: the header still decodes to a known magic - the magic and
+        // the leading control byte survive the substitution untouched - but
+        // the size behind it only becomes sane once the spaces are read back
+        // as NULs. Note the magic itself ends in a genuine space ("BMD "), so
+        // the header must NOT be blanket-patched; only the size field is.
+        const size_t probe_in = size < 16 ? size : 16;
+        std::vector<uint8_t> head = DecodeLzss(data, probe_in, 8);
+        if (head.size() < 8) return false;
+
+        const uint32_t magic = LoadBE32(head.data());
+        if (!IsKnownUncompressedMagic(magic)) return false;
+        if (EmbeddedSizeForMagic(magic, head.data(), head.size()) == 0) {
+            return false;  // no size field to cross-check against
+        }
+
+        auto plausible = [](uint32_t s) { return s >= 16 && s <= (256u << 20); };
+
+        const uint32_t as_read = LoadBE32(head.data() + 4);
+        if (plausible(as_read)) return false;  // healthy; ProbeLzss owns this
+
+        uint8_t unmasked[4];
+        for (int i = 0; i < 4; ++i) {
+            unmasked[i] = (head[4 + i] == 0x20) ? 0x00 : head[4 + i];
+        }
+        return plausible(LoadBE32(unmasked));
     }
 
     struct Decoder {
@@ -238,10 +354,17 @@ namespace {
 
 }
 
-bool TcxDecompressor::IsCompressed(const uint8_t* data, size_t size) {
-    if (!data || size < 260) return false;
-    uint32_t magic = LoadBE32(data);
-    if (IsKnownUncompressedMagic(magic)) return false;
+TcxDecompressor::Codec TcxDecompressor::DetectCodec(const uint8_t* data, size_t size) {
+    if (!data || size < 8) return Codec::None;
+    if (IsKnownUncompressedMagic(LoadBE32(data))) return Codec::None;
+
+    // Bare LZSS first: this test actually decodes and validates a magic, so it
+    // is specific. The Tcx test below is only a histogram heuristic, which an
+    // LZSS stream passes just as readily.
+    if (ProbeLzss(data, size, nullptr)) return Codec::Lzss;
+    if (ProbeLzssNulEaten(data, size)) return Codec::LzssNulEaten;
+
+    if (size < 260) return Codec::None;
 
     // Sanity check on the freq table: must have non-trivial sum and variety.
     uint32_t sum = 0;
@@ -251,14 +374,47 @@ bool TcxDecompressor::IsCompressed(const uint8_t* data, size_t size) {
         sum += data[i];
         if (!seen[data[i]]) { seen[data[i]] = 1; ++distinct; }
     }
-    if (sum < 64 || distinct < 8) return false;
-    return true;
+    if (sum < 64 || distinct < 8) return Codec::None;
+    return Codec::Tcx;
+}
+
+bool TcxDecompressor::IsCompressed(const uint8_t* data, size_t size) {
+    return DetectCodec(data, size) != Codec::None;
+}
+
+const char* TcxDecompressor::DescribeCodec(Codec c) {
+    switch (c) {
+    case Codec::None:         return "uncompressed";
+    case Codec::Tcx:          return "Tcx (freq table + arithmetic coder + LZSS)";
+    case Codec::Lzss:         return "LZSS";
+    case Codec::LzssNulEaten: return "LZSS, damaged: NUL bytes replaced by spaces";
+    }
+    return "unknown";
 }
 
 std::vector<uint8_t> TcxDecompressor::Decompress(const uint8_t* input,
     size_t input_size,
     size_t expected_size_hint) {
     std::vector<uint8_t> empty;
+
+    const Codec codec = DetectCodec(input, input_size);
+
+    // Lossy damage - decoding would desync partway and emit noise, so refuse.
+    if (codec == Codec::LzssNulEaten) return empty;
+
+    if (codec == Codec::Lzss) {
+        uint32_t embedded = 0;
+        ProbeLzss(input, input_size, &embedded);
+
+        // Prefer the caller's cap, else the size the format declares. Without
+        // either we would decode whatever trails the stream - op.bmd/ab.bmd
+        // carry an ASCII tool marker past the last group.
+        const size_t target = expected_size_hint ? expected_size_hint : embedded;
+        std::vector<uint8_t> out = DecodeLzss(input, input_size, target);
+        if (target && out.size() > target) out.resize(target);
+        return out;
+    }
+
     Decoder d;
     if (!InitDecoder(d, input, input_size)) return empty;
     size_t reserve = expected_size_hint ? expected_size_hint
@@ -282,6 +438,23 @@ std::vector<uint8_t> TcxDecompressor::Decompress(const uint8_t* input,
     }
 
     return d.output;
+}
+
+// Header-only compression test. IsCompressed needs just 260 bytes, so reading
+// the whole file to answer the question wastes an entire pass over it - which
+// on the 250 MB WAVs in sound/cxs is seconds of stalled UI per click.
+bool TcxDecompressor::IsFileCompressed(const std::string& path) {
+    return DetectFileCodec(path) != Codec::None;
+}
+
+TcxDecompressor::Codec TcxDecompressor::DetectFileCodec(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return Codec::None;
+
+    uint8_t head[260] = { 0 };
+    f.read(reinterpret_cast<char*>(head), sizeof(head));
+    const size_t got = (size_t)f.gcount();
+    return DetectCodec(head, got);
 }
 
 std::vector<uint8_t> TcxDecompressor::LoadAndMaybeDecompress(const std::string& path,
